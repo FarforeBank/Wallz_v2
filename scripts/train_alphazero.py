@@ -31,7 +31,7 @@ def env_int(name: str, default: int) -> int:
     except ValueError:
         print(f"⚠️ Ignoring invalid {name}={value!r}; using {default}")
         return default
-    return parsed if parsed > 0 else default
+    return parsed if parsed >= 0 else default
 
 
 def env_flag(name: str, default: bool = True) -> bool:
@@ -97,12 +97,27 @@ def _worker_play_game(args):
             break
 
     winner = None
+    is_tiebreaker = False
+
     if terminal:
         winner = 1 if (reward == 1.0 and env.current_player == 2) else 2
+    else:
+        p1_dist = env._get_bfs_distance(env.p1_pos, 0)
+        p2_dist = env._get_bfs_distance(env.p2_pos, 8)
+        if p1_dist < p2_dist:
+            winner = 1
+            is_tiebreaker = True
+        elif p2_dist < p1_dist:
+            winner = 2
+            is_tiebreaker = True
 
     processed = []
     for obs, p, player in game_history:
-        z = 0.0 if winner is None else (1.0 if player == winner else -1.0)
+        if winner is None:
+            z = 0.0
+        else:
+            base_z = 1.0 if player == winner else -1.0
+            z = base_z * 0.1 if is_tiebreaker else base_z
         processed.append((obs, p, z))
 
     return processed, terminal, step

@@ -5,7 +5,7 @@ import torch
 from pathlib import Path
 from playwright.async_api import async_playwright
 
-# Add project root to sys.path so we can import our modules
+# Добавляем корень проекта в sys.path для импорта модулей
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -17,41 +17,37 @@ from wallz_v2.env.action_space import action_to_move, move_to_action
 
 class WallzAssistant:
     def __init__(self, model_path):
-        # Auto-detect Apple Silicon (MPS), CUDA, or CPU
+        # Автоопределение Apple Silicon (MPS), CUDA или CPU
         self.device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Loading AlphaZero model on: {self.device}")
         
-        # Load your trained AlphaZero checkpoint
-        self.model = WallzNet(num_channels=8) # Update num_channels if you changed your state representation
+        # Загружаем чекпоинт
+        self.model = WallzNet(num_channels=8) 
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.eval()
         
-        # Initialize MCTS. Increase num_simulations (e.g., 100-200) for stronger Elo play!
+        # Инициализация MCTS
         self.mcts = MCTS(self.model, num_simulations=50) 
 
     async def extract_board_state(self, page):
         """
-        Extracts the board state by reading the algebraic move history 
-        and replaying it in a fresh internal environment.
+        Восстанавливает состояние доски, читая историю ходов (алгебраическую нотацию)
+        прямо из боковой панели сайта, и проигрывает её во внутреннем движке.
         """
         env = WallzEnv()
         
         try:
-            # 1. Grab all the moves played in the game so far chronologically
-            # We target the spans containing the actual text like "e2", "e8", "e4h"
+            # 1. Собираем все ходы
             move_elements = await page.locator('ol > li span[style*="color: var(--color-ink)"]').all_inner_texts()
             
             if not move_elements:
-                print("Game hasn't started or no moves found yet. Displaying initial state.")
                 return env
 
-            # 2. Coordinate Mapping dictionaries based on Wallz.gg SVG axes
-            # x-axis: 'i' is left (0), 'a' is right (8)
+            # 2. Маппинг координат Wallz.gg (i->a, 9->1)
             col_map = {'i': 0, 'h': 1, 'g': 2, 'f': 3, 'e': 4, 'd': 5, 'c': 6, 'b': 7, 'a': 8}
-            # y-axis: '9' is top (0), '1' is bottom (8)
             row_map = {'9': 0, '8': 1, '7': 2, '6': 3, '5': 4, '4': 5, '3': 6, '2': 7, '1': 8}
 
-            # 3. Replay history to sync the internal state
+            # 3. Проигрываем историю для синхронизации
             for move_str in move_elements:
                 move_str = move_str.strip().lower()
                 if not move_str: 
@@ -61,72 +57,181 @@ class WallzAssistant:
                 row_idx = row_map[move_str[1]]
                 
                 if len(move_str) == 2:
+                    # Для пешек координаты прямые (0-8)
                     action = move_to_action('MOVE', row_idx, col_idx)
+                    env.step(action)
+                    
                 elif len(move_str) == 3:
+                    # ИСПРАВЛЕНИЕ: Стены находятся между клетками.
+                    # e1v означает стену между столбцами e(4) и f(3) и строками 1(8) и 2(7).
+                    # В нашей матрице это индекс 3 по X и 7 по Y.
+                    wall_r = row_idx - 1
+                    wall_c = col_idx - 1
+                    
+                    # Пропускаем ошибочные парсинги (защита от крашей)
+                    if wall_r < 0 or wall_r > 7 or wall_c < 0 or wall_c > 7:
+                        continue
+                        
                     if move_str[2] == 'h':
-                        action = move_to_action('WALL_H', row_idx, col_idx)
+                        action = move_to_action('WALL_H', wall_r, wall_c)
                     elif move_str[2] == 'v':
-                        action = move_to_action('WALL_V', row_idx, col_idx)
+                        action = move_to_action('WALL_V', wall_r, wall_c)
+                        
+                    env.step(action)
                 
-                # Advance the internal engine one step
-                env.step(action)
-                
-            print(f"✅ Synced board state successfully ({len(move_elements)} moves played).")
-            
         except Exception as e:
             print(f"❌ Error parsing board history: {e}")
             
         return env
 
     async def run(self):
-        print("🚀 Booting Stealth Assistant...")
+        print("🚀 Booting Auto-Stealth Visual Assistant with Persistent Profile...")
+        
+        profile_dir = ROOT_DIR / "wallz_v2" / "browser_profile"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        
         async with async_playwright() as p:
-            # Launch standard Chromium (not headless, so you can play)
-            browser = await p.chromium.launch(
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
                 headless=False, 
-                args=['--disable-blink-features=AutomationControlled']
-            )
-            
-            # Create a stealthy context to avoid basic bot-detection
-            context = await browser.new_context(
+                args=['--disable-blink-features=AutomationControlled'],
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
-            page = await context.new_page()
+            
+            page = context.pages[0] if context.pages else await context.new_page()
             
             await page.goto("https://wallz.gg")
-            print("\n✅ Browser open! Log into your account and start a ranked match.")
-            print("When it is your turn, switch back to this terminal and press [ENTER] to get the AlphaZero move.")
+            print("\n✅ Browser open! Auto-highlighting is enabled.")
+            
+            # Маленький статус-оверлей (чтобы знать, что скрипт жив)
+            status_js = """
+            () => {
+                if (!document.getElementById('az-status')) {
+                    const status = document.createElement('div');
+                    status.id = 'az-status';
+                    status.style.position = 'fixed';
+                    status.style.bottom = '10px';
+                    status.style.right = '10px';
+                    status.style.zIndex = '999999';
+                    status.style.backgroundColor = 'rgba(15, 23, 42, 0.7)';
+                    status.style.color = '#94a3b8';
+                    status.style.padding = '8px 12px';
+                    status.style.borderRadius = '8px';
+                    status.style.fontFamily = 'monospace';
+                    status.style.fontSize = '12px';
+                    status.style.pointerEvents = 'none';
+                    status.innerText = '🟢 AI Active';
+                    document.body.appendChild(status);
+                }
+            }
+            """
+            
+            last_processed_moves = -1
             
             while True:
-                user_input = await asyncio.to_thread(input, "\n[ENTER] to calculate move (or type 'q' to quit): ")
-                if user_input.lower() == 'q':
-                    break
+                try:
+                    await page.evaluate(status_js)
                     
-                print("🧠 Analyzing board state...")
-                env = await self.extract_board_state(page)
-                
-                print("⏳ Running Monte Carlo Tree Search...")
-                # Get the absolute best move from AlphaZero (temperature=0 means strict best move)
-                action_probs = self.mcts.get_action_prob(env, temperature=0.0)
-                best_action = np.argmax(action_probs)
-                
-                move_type, (r, c) = action_to_move(best_action)
-                
-                print("\n==================================")
-                print(f"👑 TOP ELO MOVE SUGGESTION: ")
-                if move_type == 'MOVE':
-                    print(f"👉 MOVE PAWN to Row {r}, Col {c}")
-                elif move_type == 'WALL_H':
-                    print(f"🧱 PLACE HORIZONTAL WALL at Row {r}, Col {c}")
-                elif move_type == 'WALL_V':
-                    print(f"🧱 PLACE VERTICAL WALL at Row {r}, Col {c}")
-                print("==================================\n")
+                    is_my_turn = await page.locator("text='Your turn'").is_visible()
+                    
+                    if is_my_turn:
+                        move_elements = await page.locator('ol > li span[style*="color: var(--color-ink)"]').all_inner_texts()
+                        current_moves = len(move_elements)
+                        
+                        if current_moves != last_processed_moves:
+                            await page.evaluate("document.getElementById('az-status').innerText = '⏳ Thinking...'")
+                            
+                            env = await self.extract_board_state(page)
+                            action_probs = self.mcts.get_action_prob(env, temperature=0.0)
+                            best_action = np.argmax(action_probs)
+                            
+                            move_type, (r, c) = action_to_move(best_action)
+                            
+                            # --- ВНЕДРЕНИЕ ВИЗУАЛЬНОЙ ПОДСВЕТКИ ПРЯМО НА ДОСКУ ---
+                            highlight_js = f"""
+                            () => {{
+                                const svg = document.querySelector('svg[aria-label="Wallz board"]');
+                                if (!svg) return;
 
+                                // Удаляем старую подсветку
+                                let oldHighlight = document.getElementById('az-visual-hint');
+                                if (oldHighlight) oldHighlight.remove();
+
+                                const highlight = document.createElementNS("http://www.w3.org/2000/svg", "g");
+                                highlight.id = 'az-visual-hint';
+                                highlight.style.pointerEvents = 'none'; // Кликаем сквозь неё
+
+                                const moveType = '{move_type}';
+                                const r = {r};
+                                const c = {c};
+
+                                let rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+                                
+                                // Формулы на основе SVG-сетки Wallz.gg (ячейки по 60px, отступы по 12px)
+                                if (moveType === 'MOVE') {{
+                                    rect.setAttribute('x', c * 72);
+                                    rect.setAttribute('y', r * 72);
+                                    rect.setAttribute('width', 60);
+                                    rect.setAttribute('height', 60);
+                                    rect.setAttribute('rx', 9);
+                                    rect.setAttribute('fill', 'rgba(56, 189, 248, 0.4)'); // Полупрозрачный голубой
+                                    rect.setAttribute('stroke', '#38bdf8');
+                                    rect.setAttribute('stroke-width', 4);
+                                }} else if (moveType === 'WALL_H') {{
+                                    rect.setAttribute('x', c * 72);
+                                    rect.setAttribute('y', (r * 72) + 60);
+                                    rect.setAttribute('width', 132);
+                                    rect.setAttribute('height', 12);
+                                    rect.setAttribute('rx', 5);
+                                    rect.setAttribute('fill', 'rgba(250, 204, 21, 0.8)'); // Желтый
+                                    rect.setAttribute('stroke', '#facc15');
+                                }} else if (moveType === 'WALL_V') {{
+                                    rect.setAttribute('x', (c * 72) + 60);
+                                    rect.setAttribute('y', r * 72);
+                                    rect.setAttribute('width', 12);
+                                    rect.setAttribute('height', 132);
+                                    rect.setAttribute('rx', 5);
+                                    rect.setAttribute('fill', 'rgba(250, 204, 21, 0.8)'); // Желтый
+                                    rect.setAttribute('stroke', '#facc15');
+                                }}
+
+                                // Анимация пульсации, чтобы точно заметить периферийным зрением
+                                const animate = document.createElementNS("http://www.w3.org/2000/svg", "animate");
+                                animate.setAttribute('attributeName', 'opacity');
+                                animate.setAttribute('values', '0.3; 1; 0.3');
+                                animate.setAttribute('dur', '1s');
+                                animate.setAttribute('repeatCount', 'indefinite');
+                                rect.appendChild(animate);
+
+                                highlight.appendChild(rect);
+                                svg.appendChild(highlight); // Добавляем в конец SVG
+                            }}
+                            """
+                            await page.evaluate(highlight_js)
+                            
+                            # Обновляем маленький статус
+                            await page.evaluate("document.getElementById('az-status').innerText = '👑 Move Highlighted!'")
+                            print(f"Move {current_moves + 1} -> Highlighted {move_type} at ({r}, {c})")
+                            
+                            last_processed_moves = current_moves
+                    else:
+                        # Убираем подсветку, когда ход противника
+                        await page.evaluate("""() => {
+                            let oldHighlight = document.getElementById('az-visual-hint');
+                            if (oldHighlight) oldHighlight.remove();
+                            let status = document.getElementById('az-status');
+                            if (status && status.innerText !== '🟢 AI Active') status.innerText = '🟢 AI Active';
+                        }""")
+                            
+                except Exception as e:
+                    pass
+                
+                await asyncio.sleep(0.5)
 if __name__ == "__main__":
     import nest_asyncio
     nest_asyncio.apply()
     
-    # Point this to your best AlphaZero checkpoint
+    # Путь к последнему чекпоинту модели
     CHECKPOINT = ROOT_DIR / "wallz_v2" / "checkpoints" / "alphazero_latest.pt"
     
     if not CHECKPOINT.exists():
