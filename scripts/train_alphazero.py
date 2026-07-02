@@ -70,6 +70,7 @@ class AlphaZeroTrainer:
         self.save_every = env_int("AZ_SAVE_EVERY", 1)
         self.min_terminal_games = env_int("AZ_MIN_TERMINAL_GAMES", 1)
         self.max_steps_per_game = env_int("AZ_MAX_STEPS_PER_GAME", 80)
+        self.temperature_moves = env_int("AZ_TEMPERATURE_MOVES", self.max_steps_per_game)
         self.repetition_limit = env_int("AZ_REPETITION_LIMIT", 3)
         self.avoid_repeats = env_flag("AZ_AVOID_REPEATS", True)
         self.timeout_policy = os.getenv("AZ_TIMEOUT_POLICY", "distance").strip().lower()
@@ -89,7 +90,7 @@ class AlphaZeroTrainer:
             f"epochs={self.epochs}, games_per_epoch={self.games_per_epoch}, "
             f"mcts_simulations={self.mcts_simulations}, batch_size={self.batch_size}, "
             f"save_every={self.save_every}, min_terminal_games={self.min_terminal_games}, "
-            f"max_steps_per_game={self.max_steps_per_game}, "
+            f"max_steps_per_game={self.max_steps_per_game}, temperature_moves={self.temperature_moves}, "
             f"repetition_limit={self.repetition_limit}, avoid_repeats={self.avoid_repeats}, "
             f"timeout_policy={self.timeout_policy}, "
             f"device={self.device}, torch_threads={torch.get_num_threads()}, "
@@ -227,14 +228,21 @@ class AlphaZeroTrainer:
         return self._state_key(sim_env) in seen_states
 
     def _select_self_play_action(self, env: WallzEnv, action_probs, temperature: float, seen_states: dict):
-        """Pick an action from MCTS policy, optionally filtering one-step repeated states."""
-        probs = np.asarray(action_probs, dtype=np.float64)
-        legal_actions = np.flatnonzero(probs > 0)
+        """Pick an action from MCTS policy, escaping repeated states with legal-action fallback."""
+        mcts_probs = np.asarray(action_probs, dtype=np.float64)
+        legal_mask = env.get_legal_action_mask()
+        legal_actions = np.flatnonzero(legal_mask)
         if len(legal_actions) == 0:
-            raise RuntimeError("MCTS returned no legal actions.")
+            raise RuntimeError("Environment returned no legal actions.")
+
+        probs = np.zeros_like(mcts_probs)
+        probs[legal_actions] = mcts_probs[legal_actions]
+        if probs.sum() <= 0:
+            probs[legal_actions] = 1.0 / len(legal_actions)
 
         filtered = probs.copy()
         avoided_repeat = False
+        escaped_forced_repeat = False
 
         if self.avoid_repeats:
             non_repeat_actions = [
@@ -243,21 +251,29 @@ class AlphaZeroTrainer:
                 if not self._action_repeats_state(env, int(action), seen_states)
             ]
             if non_repeat_actions:
-                mask = np.zeros_like(filtered, dtype=bool)
-                mask[non_repeat_actions] = True
-                filtered[~mask] = 0.0
+                repeat_filter = np.zeros_like(filtered, dtype=bool)
+                repeat_filter[non_repeat_actions] = True
+                filtered[~repeat_filter] = 0.0
                 avoided_repeat = len(non_repeat_actions) < len(legal_actions)
+
+                # If MCTS put all probability mass on repeating actions, escape using all legal non-repeat moves.
+                if filtered.sum() <= 0:
+                    filtered[non_repeat_actions] = 1.0 / len(non_repeat_actions)
+                    escaped_forced_repeat = True
 
         total = filtered.sum()
         if total <= 0:
-            filtered = probs.copy()
+            # Last-resort fallback: legal uniform. This should be rare, but keeps self-play alive.
+            filtered = np.zeros_like(mcts_probs)
+            filtered[legal_actions] = 1.0 / len(legal_actions)
             total = filtered.sum()
 
-        if temperature == 0:
-            return int(np.argmax(filtered)), avoided_repeat
-
         filtered = filtered / total
-        return int(np.random.choice(len(filtered), p=filtered)), avoided_repeat
+
+        if temperature == 0:
+            return int(np.argmax(filtered)), avoided_repeat, escaped_forced_repeat
+
+        return int(np.random.choice(len(filtered), p=filtered)), avoided_repeat, escaped_forced_repeat
 
     def _adjudicate_non_terminal_game(self, env: WallzEnv):
         """Resolve training-only non-terminal games caused by max-step or repetition limits."""
@@ -304,6 +320,7 @@ class AlphaZeroTrainer:
         adjudicated_games = 0
         skipped_games = 0
         repeat_avoids = 0
+        repeat_escapes = 0
         total_steps = 0
 
         for game in game_iter:
@@ -318,8 +335,7 @@ class AlphaZeroTrainer:
             stop_reason = None
 
             while not terminal and step < self.max_steps_per_game:
-                # Use temperature=1.0 for the first 15 moves to encourage exploration, then 0 to play strict best moves
-                temp = 1.0 if step < 15 else 0.0
+                temp = 1.0 if step < self.temperature_moves else 0.0
 
                 # MCTS thinking
                 action_probs = mcts.get_action_prob(env, temperature=temp)
@@ -327,9 +343,13 @@ class AlphaZeroTrainer:
                 # Store state and target policy (from MCTS)
                 game_history.append((env.get_observation(), action_probs, env.current_player))
 
-                action, avoided_repeat = self._select_self_play_action(env, action_probs, temp, seen_states)
+                action, avoided_repeat, escaped_forced_repeat = self._select_self_play_action(
+                    env, action_probs, temp, seen_states
+                )
                 if avoided_repeat:
                     repeat_avoids += 1
+                if escaped_forced_repeat:
+                    repeat_escapes += 1
 
                 _, reward, terminal, _ = env.step(action)
                 step += 1
@@ -346,6 +366,7 @@ class AlphaZeroTrainer:
                         step=step,
                         replay=len(self.replay_buffer),
                         avoided=repeat_avoids,
+                        escapes=repeat_escapes,
                         refresh=False,
                     )
 
@@ -393,6 +414,7 @@ class AlphaZeroTrainer:
                     status=status,
                     replay=len(self.replay_buffer),
                     avoided=repeat_avoids,
+                    escapes=repeat_escapes,
                     refresh=True,
                 )
             else:
@@ -405,6 +427,7 @@ class AlphaZeroTrainer:
             "adjudicated_games": adjudicated_games,
             "skipped_games": skipped_games,
             "repeat_avoids": repeat_avoids,
+            "repeat_escapes": repeat_escapes,
             "avg_steps": avg_steps,
             "replay_buffer": len(self.replay_buffer),
         }
@@ -500,6 +523,7 @@ class AlphaZeroTrainer:
                     "avg_steps": f"{stats['avg_steps']:.1f}",
                     "replay": stats["replay_buffer"],
                     "avoided": stats["repeat_avoids"],
+                    "escapes": stats["repeat_escapes"],
                 }
                 if losses is not None:
                     postfix["loss"] = f"{losses['total_loss']:.3f}"
