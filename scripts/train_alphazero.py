@@ -34,8 +34,19 @@ def env_int(name: str, default: int) -> int:
 
 class AlphaZeroTrainer:
     def __init__(self):
-        self.device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+        # CPU is now the safe default for AlphaZero/MCTS. Override with AZ_DEVICE=auto, mps, cuda, or cpu.
+        self.cpu_threads = env_int("AZ_TORCH_THREADS", 20)
+        self.cpu_interop_threads = env_int("AZ_TORCH_INTEROP_THREADS", 1)
+        torch.set_num_threads(self.cpu_threads)
+        try:
+            torch.set_num_interop_threads(self.cpu_interop_threads)
+        except RuntimeError as exc:
+            print(f"⚠️ Could not set interop threads after torch initialization: {exc}")
+
+        self.device = self._select_device()
         print(f"Using device: {self.device}")
+        print(f"Torch CPU threads: {torch.get_num_threads()}")
+        print(f"Torch CPU interop threads: {torch.get_num_interop_threads()}")
 
         self.model = WallzNet().to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3, weight_decay=1e-4)
@@ -59,8 +70,35 @@ class AlphaZeroTrainer:
             "Config -> "
             f"epochs={self.epochs}, games_per_epoch={self.games_per_epoch}, "
             f"mcts_simulations={self.mcts_simulations}, batch_size={self.batch_size}, "
-            f"save_every={self.save_every}, max_steps_per_game={self.max_steps_per_game}"
+            f"save_every={self.save_every}, max_steps_per_game={self.max_steps_per_game}, "
+            f"device={self.device}, torch_threads={torch.get_num_threads()}"
         )
+
+    def _select_device(self) -> torch.device:
+        requested = os.getenv("AZ_DEVICE", "cpu").strip().lower()
+
+        if requested == "auto":
+            if torch.backends.mps.is_available():
+                return torch.device("mps")
+            if torch.cuda.is_available():
+                return torch.device("cuda")
+            return torch.device("cpu")
+
+        if requested == "mps":
+            if torch.backends.mps.is_available():
+                return torch.device("mps")
+            print("⚠️ AZ_DEVICE=mps requested, but MPS is unavailable. Falling back to CPU.")
+            return torch.device("cpu")
+
+        if requested == "cuda":
+            if torch.cuda.is_available():
+                return torch.device("cuda")
+            print("⚠️ AZ_DEVICE=cuda requested, but CUDA is unavailable. Falling back to CPU.")
+            return torch.device("cpu")
+
+        if requested != "cpu":
+            print(f"⚠️ Unknown AZ_DEVICE={requested!r}; using CPU.")
+        return torch.device("cpu")
 
     def _checkpoint_epoch(self, path: Path):
         match = re.fullmatch(r"alphazero_epoch_(\d+)\.pt", path.name)
