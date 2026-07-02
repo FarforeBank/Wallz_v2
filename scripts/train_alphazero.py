@@ -68,6 +68,7 @@ class AlphaZeroTrainer:
         self.mcts_simulations = env_int("AZ_MCTS_SIMULATIONS", 5)
         self.batch_size = env_int("AZ_BATCH_SIZE", 64)
         self.save_every = env_int("AZ_SAVE_EVERY", 1)
+        self.min_terminal_games = env_int("AZ_MIN_TERMINAL_GAMES", 1)
         self.max_steps_per_game = env_int("AZ_MAX_STEPS_PER_GAME", 80)
         self.repetition_limit = env_int("AZ_REPETITION_LIMIT", 3)
         self.avoid_repeats = env_flag("AZ_AVOID_REPEATS", True)
@@ -87,7 +88,8 @@ class AlphaZeroTrainer:
             "Config -> "
             f"epochs={self.epochs}, games_per_epoch={self.games_per_epoch}, "
             f"mcts_simulations={self.mcts_simulations}, batch_size={self.batch_size}, "
-            f"save_every={self.save_every}, max_steps_per_game={self.max_steps_per_game}, "
+            f"save_every={self.save_every}, min_terminal_games={self.min_terminal_games}, "
+            f"max_steps_per_game={self.max_steps_per_game}, "
             f"repetition_limit={self.repetition_limit}, avoid_repeats={self.avoid_repeats}, "
             f"timeout_policy={self.timeout_policy}, "
             f"device={self.device}, torch_threads={torch.get_num_threads()}, "
@@ -385,8 +387,19 @@ class AlphaZeroTrainer:
             "replay_buffer": len(self.replay_buffer),
         }
 
-    def train_network(self):
-        """Trains the Neural Network using the experiences gathered by MCTS."""
+    def train_network(self, terminal_games_this_epoch: int):
+        """Trains the Neural Network only when new real terminal games were generated this epoch."""
+        if terminal_games_this_epoch < self.min_terminal_games:
+            message = (
+                f"Terminal games this epoch too low: "
+                f"{terminal_games_this_epoch}/{self.min_terminal_games}. Skipping network update."
+            )
+            if self.show_progress:
+                tqdm.write(message)
+            else:
+                print(message)
+            return None
+
         if len(self.replay_buffer) < self.batch_size:
             message = f"Replay buffer too small: {len(self.replay_buffer)}/{self.batch_size}. Skipping network update."
             if self.show_progress:
@@ -454,23 +467,28 @@ class AlphaZeroTrainer:
                 print(f"\n{'=' * 40}\n AlphaZero Epoch {epoch}/{final_epoch}\n{'=' * 40}")
 
             stats = self.self_play()
-            losses = self.train_network()
+            losses = self.train_network(stats["completed_games"])
 
             if self.show_progress:
                 postfix = {
                     "epoch": f"{epoch}/{final_epoch}",
                     "games": stats["completed_games"],
                     "adj": stats["adjudicated_games"],
+                    "skip": stats["skipped_games"],
                     "avg_steps": f"{stats['avg_steps']:.1f}",
                     "replay": stats["replay_buffer"],
                     "avoided": stats["repeat_avoids"],
                 }
                 if losses is not None:
                     postfix["loss"] = f"{losses['total_loss']:.3f}"
+                else:
+                    postfix["loss"] = "skipped"
                 epoch_iter.set_postfix(postfix, refresh=True)
 
-            if epoch % self.save_every == 0:
+            if losses is not None and epoch % self.save_every == 0:
                 self.save_checkpoint(epoch)
+            elif losses is None:
+                tqdm.write(f"⏭️ Not saving epoch {epoch}: model was not updated.")
 
 
 if __name__ == '__main__':
