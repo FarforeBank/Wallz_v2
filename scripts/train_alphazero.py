@@ -32,6 +32,14 @@ def env_int(name: str, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def env_flag(name: str, default: bool = True) -> bool:
+    """Read a boolean-ish flag from env."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 class AlphaZeroTrainer:
     def __init__(self):
         # CPU is now the safe default for AlphaZero/MCTS. Override with AZ_DEVICE=auto, mps, cuda, or cpu.
@@ -59,6 +67,7 @@ class AlphaZeroTrainer:
         self.batch_size = env_int("AZ_BATCH_SIZE", 64)
         self.save_every = env_int("AZ_SAVE_EVERY", 1)
         self.max_steps_per_game = env_int("AZ_MAX_STEPS_PER_GAME", 200)
+        self.show_progress = env_flag("AZ_PROGRESS", True)
         self.replay_buffer = deque(maxlen=10000)
 
         self.checkpoint_dir = ROOT_DIR / "wallz_v2" / "checkpoints"
@@ -71,7 +80,8 @@ class AlphaZeroTrainer:
             f"epochs={self.epochs}, games_per_epoch={self.games_per_epoch}, "
             f"mcts_simulations={self.mcts_simulations}, batch_size={self.batch_size}, "
             f"save_every={self.save_every}, max_steps_per_game={self.max_steps_per_game}, "
-            f"device={self.device}, torch_threads={torch.get_num_threads()}"
+            f"device={self.device}, torch_threads={torch.get_num_threads()}, "
+            f"progress={self.show_progress}"
         )
 
     def _select_device(self) -> torch.device:
@@ -131,15 +141,30 @@ class AlphaZeroTrainer:
         torch.save(self.model.state_dict(), path)
         latest_path = self.checkpoint_dir / "alphazero_latest.pt"
         torch.save(self.model.state_dict(), latest_path)
-        print(f"💾 Saved checkpoint to {path}")
-        print(f"💾 Updated latest checkpoint at {latest_path}")
+        tqdm.write(f"💾 Saved checkpoint to {path}")
+        tqdm.write(f"💾 Updated latest checkpoint at {latest_path}")
 
     def self_play(self):
         """Generates training data by having the network play against itself using MCTS."""
-        print(f"\n🎮 Generating {self.games_per_epoch} self-play games...")
         self.model.eval()
+        game_iter = range(self.games_per_epoch)
+        if self.show_progress:
+            game_iter = tqdm(
+                game_iter,
+                total=self.games_per_epoch,
+                desc="Self-play games",
+                unit="game",
+                leave=False,
+                dynamic_ncols=True,
+            )
+        else:
+            print(f"\n🎮 Generating {self.games_per_epoch} self-play games...")
 
-        for game in range(self.games_per_epoch):
+        completed_games = 0
+        skipped_games = 0
+        total_steps = 0
+
+        for game in game_iter:
             env = WallzEnv()
             mcts = MCTS(self.model, num_simulations=self.mcts_simulations)
             game_history = []
@@ -167,8 +192,21 @@ class AlphaZeroTrainer:
                 _, reward, terminal, _ = env.step(action)
                 step += 1
 
+                if self.show_progress and step % 5 == 0:
+                    game_iter.set_postfix(
+                        game=game + 1,
+                        step=step,
+                        replay=len(self.replay_buffer),
+                        refresh=False,
+                    )
+
             if not terminal:
-                print(f"⚠️ Game {game + 1}/{self.games_per_epoch} hit max_steps={self.max_steps_per_game}; skipping it.")
+                skipped_games += 1
+                message = f"⚠️ Game {game + 1}/{self.games_per_epoch} hit max_steps={self.max_steps_per_game}; skipping it."
+                if self.show_progress:
+                    tqdm.write(message)
+                else:
+                    print(message)
                 continue
 
             # Game over, assign final values to the history buffer
@@ -179,15 +217,41 @@ class AlphaZeroTrainer:
                 z = 1.0 if player == winner else -1.0
                 self.replay_buffer.append((obs, probs, z))
 
-            print(f"Game {game + 1}/{self.games_per_epoch} complete (Steps: {step}). Winner: P{winner}")
+            completed_games += 1
+            total_steps += step
+            if self.show_progress:
+                game_iter.set_postfix(
+                    game=game + 1,
+                    steps=step,
+                    winner=f"P{winner}",
+                    replay=len(self.replay_buffer),
+                    refresh=True,
+                )
+            else:
+                print(f"Game {game + 1}/{self.games_per_epoch} complete (Steps: {step}). Winner: P{winner}")
+
+        avg_steps = total_steps / completed_games if completed_games else 0.0
+        return {
+            "completed_games": completed_games,
+            "skipped_games": skipped_games,
+            "avg_steps": avg_steps,
+            "replay_buffer": len(self.replay_buffer),
+        }
 
     def train_network(self):
         """Trains the Neural Network using the experiences gathered by MCTS."""
         if len(self.replay_buffer) < self.batch_size:
-            print(f"Replay buffer too small: {len(self.replay_buffer)}/{self.batch_size}. Skipping network update.")
-            return
+            message = f"Replay buffer too small: {len(self.replay_buffer)}/{self.batch_size}. Skipping network update."
+            if self.show_progress:
+                tqdm.write(message)
+            else:
+                print(message)
+            return None
 
-        print("\n🧠 Training Neural Network...")
+        if self.show_progress:
+            tqdm.write("🧠 Training Neural Network...")
+        else:
+            print("\n🧠 Training Neural Network...")
         self.model.train()
 
         batch = random.sample(self.replay_buffer, self.batch_size)
@@ -210,15 +274,51 @@ class AlphaZeroTrainer:
         total_loss.backward()
         self.optimizer.step()
 
-        print(f"Loss -> Policy: {policy_loss.item():.4f} | Value: {value_loss.item():.4f} | Total: {total_loss.item():.4f}")
+        losses = {
+            "policy_loss": policy_loss.item(),
+            "value_loss": value_loss.item(),
+            "total_loss": total_loss.item(),
+        }
+        message = (
+            f"Loss -> Policy: {losses['policy_loss']:.4f} | "
+            f"Value: {losses['value_loss']:.4f} | Total: {losses['total_loss']:.4f}"
+        )
+        if self.show_progress:
+            tqdm.write(message)
+        else:
+            print(message)
+        return losses
 
     def learn(self):
         final_epoch = self.start_epoch + self.epochs - 1
-        for epoch in range(self.start_epoch, final_epoch + 1):
+        epoch_iter = range(self.start_epoch, final_epoch + 1)
+        if self.show_progress:
+            epoch_iter = tqdm(
+                epoch_iter,
+                total=self.epochs,
+                desc="AlphaZero epochs",
+                unit="epoch",
+                dynamic_ncols=True,
+            )
+
+        for epoch in epoch_iter:
             self.current_epoch = epoch
-            print(f"\n{'=' * 40}\n AlphaZero Epoch {epoch}/{final_epoch}\n{'=' * 40}")
-            self.self_play()
-            self.train_network()
+            if not self.show_progress:
+                print(f"\n{'=' * 40}\n AlphaZero Epoch {epoch}/{final_epoch}\n{'=' * 40}")
+
+            stats = self.self_play()
+            losses = self.train_network()
+
+            if self.show_progress:
+                postfix = {
+                    "epoch": f"{epoch}/{final_epoch}",
+                    "games": stats["completed_games"],
+                    "avg_steps": f"{stats['avg_steps']:.1f}",
+                    "replay": stats["replay_buffer"],
+                }
+                if losses is not None:
+                    postfix["loss"] = f"{losses['total_loss']:.3f}"
+                epoch_iter.set_postfix(postfix, refresh=True)
 
             if epoch % self.save_every == 0:
                 self.save_checkpoint(epoch)
