@@ -401,7 +401,70 @@ class BrowserAgentV2:
 
                 print(f"[Move] P1={p1_pos} P2={p2_pos} {action_name(action)}->{target_pos}{guard}")
 
-                page.mouse.click(target["x"], target["y"])
+                click_x = target["x"]
+
+
+                click_y = target["y"]
+
+
+                # Удаляем старые подсветки перед отрисовкой новой
+
+
+                page.evaluate("document.querySelectorAll('.ai-highlight').forEach(e => e.remove());")
+
+
+                
+
+
+                # JS-код для создания светящегося маркера
+
+
+                js_draw = f"""
+
+
+                    let div = document.createElement('div');
+
+
+                    div.className = 'ai-highlight';
+
+
+                    div.style.position = 'absolute';
+
+
+                    div.style.left = '{click_x - 20}px';
+
+
+                    div.style.top = '{click_y - 20}px';
+
+
+                    div.style.width = '40px';
+
+
+                    div.style.height = '40px';
+
+
+                    div.style.border = '4px solid #00FF00';
+
+
+                    div.style.borderRadius = '{'50%' if action < 81 else '4px'}';
+
+
+                    div.style.zIndex = '9999';
+
+
+                    div.style.pointerEvents = 'none'; // Чтобы маркер не мешал вам кликать
+
+
+                    div.style.boxShadow = '0 0 15px #00FF00, inset 0 0 10px #00FF00';
+
+
+                    document.body.appendChild(div);
+
+
+                """
+
+
+                page.evaluate(js_draw)
 
             else:
 
@@ -417,7 +480,64 @@ class BrowserAgentV2:
 
                 print(f"[{move_type}] P1={p1_pos} P2={p2_pos} r={r} c={c}{guard}")
 
-                page.mouse.click(click_x, click_y)
+                # Удаляем старые подсветки перед отрисовкой новой
+
+
+                page.evaluate("document.querySelectorAll('.ai-highlight').forEach(e => e.remove());")
+
+
+                
+
+
+                # JS-код для создания светящегося маркера
+
+
+                js_draw = f"""
+
+
+                    let div = document.createElement('div');
+
+
+                    div.className = 'ai-highlight';
+
+
+                    div.style.position = 'absolute';
+
+
+                    div.style.left = '{click_x - 20}px';
+
+
+                    div.style.top = '{click_y - 20}px';
+
+
+                    div.style.width = '40px';
+
+
+                    div.style.height = '40px';
+
+
+                    div.style.border = '4px solid #00FF00';
+
+
+                    div.style.borderRadius = '{'50%' if action < 81 else '4px'}';
+
+
+                    div.style.zIndex = '9999';
+
+
+                    div.style.pointerEvents = 'none'; // Чтобы маркер не мешал вам кликать
+
+
+                    div.style.boxShadow = '0 0 15px #00FF00, inset 0 0 10px #00FF00';
+
+
+                    document.body.appendChild(div);
+
+
+                """
+
+
+                page.evaluate(js_draw)
 
                 self.position_history.append(target_pos)
                 self.position_history = self.position_history[-12:]
