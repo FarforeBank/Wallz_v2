@@ -123,11 +123,17 @@ class AlphaZeroTrainer:
         return torch.device("cpu")
 
     def _checkpoint_epoch(self, path: Path):
-        match = re.fullmatch(r"alphazero_epoch_(\d+)\.pt", path.name)
-        if match:
-            return int(match.group(1))
-        match = re.fullmatch(r"alphazero_interrupt_epoch_(\d+)\.pt", path.name)
-        return int(match.group(1)) if match else None
+        """Infer epoch number from standard and named checkpoint files."""
+        patterns = (
+            r"alphazero_epoch_(\d+)(?:_v\d+)?\.pt",
+            r"alphazero_interrupt_epoch_(\d+)(?:_v\d+)?\.pt",
+            r".*epoch_(\d+)(?:_v\d+)?\.pt",
+        )
+        for pattern in patterns:
+            match = re.fullmatch(pattern, path.name)
+            if match:
+                return int(match.group(1))
+        return None
 
     def _resolve_checkpoint_override(self):
         requested = os.getenv("AZ_RESUME_FROM")
@@ -175,11 +181,27 @@ class AlphaZeroTrainer:
         print(f"Resuming after epoch {epoch}.")
         return epoch
 
+    def _unique_checkpoint_path(self, path: Path) -> Path:
+        """Never overwrite existing epoch checkpoints; create _v2, _v3, ... instead."""
+        if not path.exists():
+            return path
+
+        version = 2
+        while True:
+            candidate = path.with_name(f"{path.stem}_v{version}{path.suffix}")
+            if not candidate.exists():
+                return candidate
+            version += 1
+
     def save_checkpoint(self, epoch: int, interrupted: bool = False):
         if interrupted:
-            path = self.checkpoint_dir / f"alphazero_interrupt_epoch_{epoch}.pt"
+            target_path = self.checkpoint_dir / f"alphazero_interrupt_epoch_{epoch}.pt"
         else:
-            path = self.checkpoint_dir / f"alphazero_epoch_{epoch}.pt"
+            target_path = self.checkpoint_dir / f"alphazero_epoch_{epoch}.pt"
+
+        path = self._unique_checkpoint_path(target_path)
+        if path != target_path:
+            tqdm.write(f"⚠️ {target_path} already exists; saving without overwrite to {path}")
 
         torch.save(self.model.state_dict(), path)
         latest_path = self.checkpoint_dir / "alphazero_latest.pt"
