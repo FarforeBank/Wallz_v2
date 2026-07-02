@@ -66,7 +66,12 @@ class AlphaZeroTrainer:
         self.mcts_simulations = env_int("AZ_MCTS_SIMULATIONS", 5)
         self.batch_size = env_int("AZ_BATCH_SIZE", 64)
         self.save_every = env_int("AZ_SAVE_EVERY", 1)
-        self.max_steps_per_game = env_int("AZ_MAX_STEPS_PER_GAME", 200)
+        self.max_steps_per_game = env_int("AZ_MAX_STEPS_PER_GAME", 80)
+        self.repetition_limit = env_int("AZ_REPETITION_LIMIT", 3)
+        self.timeout_policy = os.getenv("AZ_TIMEOUT_POLICY", "distance").strip().lower()
+        if self.timeout_policy not in {"distance", "draw", "skip"}:
+            print(f"⚠️ Unknown AZ_TIMEOUT_POLICY={self.timeout_policy!r}; using 'distance'.")
+            self.timeout_policy = "distance"
         self.show_progress = env_flag("AZ_PROGRESS", True)
         self.replay_buffer = deque(maxlen=10000)
 
@@ -80,6 +85,7 @@ class AlphaZeroTrainer:
             f"epochs={self.epochs}, games_per_epoch={self.games_per_epoch}, "
             f"mcts_simulations={self.mcts_simulations}, batch_size={self.batch_size}, "
             f"save_every={self.save_every}, max_steps_per_game={self.max_steps_per_game}, "
+            f"repetition_limit={self.repetition_limit}, timeout_policy={self.timeout_policy}, "
             f"device={self.device}, torch_threads={torch.get_num_threads()}, "
             f"progress={self.show_progress}"
         )
@@ -112,20 +118,24 @@ class AlphaZeroTrainer:
 
     def _checkpoint_epoch(self, path: Path):
         match = re.fullmatch(r"alphazero_epoch_(\d+)\.pt", path.name)
+        if match:
+            return int(match.group(1))
+        match = re.fullmatch(r"alphazero_interrupt_epoch_(\d+)\.pt", path.name)
         return int(match.group(1)) if match else None
 
     def _load_latest_checkpoint(self) -> int:
         checkpoints = []
-        for path in self.checkpoint_dir.glob("alphazero_epoch_*.pt"):
-            epoch = self._checkpoint_epoch(path)
-            if epoch is not None:
-                checkpoints.append((epoch, path))
+        for pattern in ("alphazero_epoch_*.pt", "alphazero_interrupt_epoch_*.pt"):
+            for path in self.checkpoint_dir.glob(pattern):
+                epoch = self._checkpoint_epoch(path)
+                if epoch is not None:
+                    checkpoints.append((epoch, path.stat().st_mtime, path))
 
         if not checkpoints:
             print("No AlphaZero checkpoint found. Starting from scratch.")
             return 0
 
-        epoch, path = max(checkpoints, key=lambda item: item[0])
+        epoch, _, path = max(checkpoints, key=lambda item: (item[0], item[1]))
         print(f"♻️ Loading AlphaZero checkpoint: {path}")
         state_dict = torch.load(path, map_location=self.device)
         self.model.load_state_dict(state_dict)
@@ -144,6 +154,43 @@ class AlphaZeroTrainer:
         tqdm.write(f"💾 Saved checkpoint to {path}")
         tqdm.write(f"💾 Updated latest checkpoint at {latest_path}")
 
+    def _state_key(self, env: WallzEnv):
+        """Compact repeat-detection key for training only; does not change environment rules."""
+        return (
+            env.p1_pos,
+            env.p2_pos,
+            env.current_player,
+            env.walls_left[1],
+            env.walls_left[2],
+            env.h_walls.tobytes(),
+            env.v_walls.tobytes(),
+        )
+
+    def _adjudicate_non_terminal_game(self, env: WallzEnv):
+        """Resolve training-only non-terminal games caused by max-step or repetition limits."""
+        if self.timeout_policy == "skip":
+            return "skip", None
+        if self.timeout_policy == "draw":
+            return "draw", None
+
+        p1_distance = env._get_bfs_distance(env.p1_pos, 0)
+        p2_distance = env._get_bfs_distance(env.p2_pos, 8)
+
+        if p1_distance < p2_distance:
+            return "distance", 1
+        if p2_distance < p1_distance:
+            return "distance", 2
+        return "draw", None
+
+    def _append_game_history(self, game_history, winner):
+        for obs, probs, player in game_history:
+            if winner is None:
+                z = 0.0
+            else:
+                # Value is +1 if this player won, -1 if they lost
+                z = 1.0 if player == winner else -1.0
+            self.replay_buffer.append((obs, probs, z))
+
     def self_play(self):
         """Generates training data by having the network play against itself using MCTS."""
         self.model.eval()
@@ -161,6 +208,7 @@ class AlphaZeroTrainer:
             print(f"\n🎮 Generating {self.games_per_epoch} self-play games...")
 
         completed_games = 0
+        adjudicated_games = 0
         skipped_games = 0
         total_steps = 0
 
@@ -168,10 +216,12 @@ class AlphaZeroTrainer:
             env = WallzEnv()
             mcts = MCTS(self.model, num_simulations=self.mcts_simulations)
             game_history = []
+            seen_states = {self._state_key(env): 1}
 
             terminal = False
             reward = 0.0
             step = 0
+            stop_reason = None
 
             while not terminal and step < self.max_steps_per_game:
                 # Use temperature=1.0 for the first 15 moves to encourage exploration, then 0 to play strict best moves
@@ -192,6 +242,12 @@ class AlphaZeroTrainer:
                 _, reward, terminal, _ = env.step(action)
                 step += 1
 
+                state_key = self._state_key(env)
+                seen_states[state_key] = seen_states.get(state_key, 0) + 1
+                if not terminal and seen_states[state_key] >= self.repetition_limit:
+                    stop_reason = "repetition"
+                    break
+
                 if self.show_progress and step % 5 == 0:
                     game_iter.set_postfix(
                         game=game + 1,
@@ -200,39 +256,59 @@ class AlphaZeroTrainer:
                         refresh=False,
                     )
 
-            if not terminal:
-                skipped_games += 1
-                message = f"⚠️ Game {game + 1}/{self.games_per_epoch} hit max_steps={self.max_steps_per_game}; skipping it."
+            if not terminal and stop_reason is None:
+                stop_reason = "max_steps"
+
+            if terminal:
+                # Game over, assign final values to the history buffer
+                winner = 1 if (reward == 1.0 and env.current_player == 2) else 2
+                self._append_game_history(game_history, winner)
+                completed_games += 1
+                total_steps += step
+                status = f"winner=P{winner}"
+            else:
+                outcome, winner = self._adjudicate_non_terminal_game(env)
+                if outcome == "skip":
+                    skipped_games += 1
+                    message = (
+                        f"⚠️ Game {game + 1}/{self.games_per_epoch} stopped by {stop_reason} "
+                        f"at step={step}; skipping it."
+                    )
+                    if self.show_progress:
+                        tqdm.write(message)
+                    else:
+                        print(message)
+                    continue
+
+                self._append_game_history(game_history, winner)
+                adjudicated_games += 1
+                total_steps += step
+                status = "draw" if winner is None else f"adjudicated=P{winner}"
+                message = (
+                    f"⚖️ Game {game + 1}/{self.games_per_epoch} stopped by {stop_reason} "
+                    f"at step={step}; {status}."
+                )
                 if self.show_progress:
                     tqdm.write(message)
                 else:
                     print(message)
-                continue
 
-            # Game over, assign final values to the history buffer
-            winner = 1 if (reward == 1.0 and env.current_player == 2) else 2
-
-            for obs, probs, player in game_history:
-                # Value is +1 if this player won, -1 if they lost
-                z = 1.0 if player == winner else -1.0
-                self.replay_buffer.append((obs, probs, z))
-
-            completed_games += 1
-            total_steps += step
             if self.show_progress:
                 game_iter.set_postfix(
                     game=game + 1,
                     steps=step,
-                    winner=f"P{winner}",
+                    status=status,
                     replay=len(self.replay_buffer),
                     refresh=True,
                 )
             else:
-                print(f"Game {game + 1}/{self.games_per_epoch} complete (Steps: {step}). Winner: P{winner}")
+                print(f"Game {game + 1}/{self.games_per_epoch} complete (Steps: {step}). {status}")
 
-        avg_steps = total_steps / completed_games if completed_games else 0.0
+        counted_games = completed_games + adjudicated_games
+        avg_steps = total_steps / counted_games if counted_games else 0.0
         return {
             "completed_games": completed_games,
+            "adjudicated_games": adjudicated_games,
             "skipped_games": skipped_games,
             "avg_steps": avg_steps,
             "replay_buffer": len(self.replay_buffer),
@@ -313,6 +389,7 @@ class AlphaZeroTrainer:
                 postfix = {
                     "epoch": f"{epoch}/{final_epoch}",
                     "games": stats["completed_games"],
+                    "adj": stats["adjudicated_games"],
                     "avg_steps": f"{stats['avg_steps']:.1f}",
                     "replay": stats["replay_buffer"],
                 }
