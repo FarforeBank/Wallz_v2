@@ -49,7 +49,7 @@ import multiprocessing as mp
 def _worker_play_game(args):
     state_dict, config, game_idx = args
     # Force workers onto CPU to prevent M4 Pro Metal (MPS) contention locks
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = WallzNet().to(device)
     model.load_state_dict(state_dict)
     model.eval()
