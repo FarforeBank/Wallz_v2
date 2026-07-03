@@ -70,16 +70,24 @@ def _worker_play_game(args):
     while not terminal and step < config['max_steps']:
         temp = 1.0 if step < config['temp_moves'] else 0.0
         action_probs = mcts.get_action_prob(env, temperature=temp)
-        game_history.append((env.get_observation(), action_probs, env.current_player))
+        game_history.append((env.get_observation(), env.get_legal_action_mask(), action_probs, env.current_player))
 
         legal_mask = env.get_legal_action_mask()
         legal_actions = np.flatnonzero(legal_mask)
         probs = np.zeros(209)
         probs[legal_actions] = action_probs[legal_actions]
         
+        # Жесткий запрет на возвращение в прошлые состояния
+        for act in legal_actions:
+            sim_env = copy.deepcopy(env)
+            sim_env.step(int(act))
+            if seen_states.get(state_key(sim_env), 0) >= 1:
+                probs[act] = 0.0
+                
         total_prob = probs.sum()
         if total_prob <= 0:
             probs[legal_actions] = 1.0 / len(legal_actions)
+            probs /= probs.sum()
         else:
             probs /= total_prob
 
@@ -114,13 +122,13 @@ def _worker_play_game(args):
             is_tiebreaker = True
 
     processed = []
-    for obs, p, player in game_history:
+    for obs, mask, p, player in game_history:
         if winner is None:
             z = 0.0
         else:
             base_z = 1.0 if player == winner else -1.0
             z = base_z * 0.1 if is_tiebreaker else base_z
-        processed.append((obs, p, z))
+        processed.append((obs, mask, p, z))
 
     return processed, terminal, step
 
@@ -460,10 +468,11 @@ class AlphaZeroTrainer:
         for _ in range(training_steps):
             batch = random.sample(self.replay_buffer, self.batch_size)
             state_batch = torch.FloatTensor(np.array([x[0] for x in batch])).to(self.device)
-            prob_batch = torch.FloatTensor(np.array([x[1] for x in batch])).to(self.device)
-            value_batch = torch.FloatTensor(np.array([x[2] for x in batch]).astype(np.float32)).unsqueeze(1).to(self.device)
+            mask_batch = torch.BoolTensor(np.array([x[1] for x in batch])).to(self.device)
+            prob_batch = torch.FloatTensor(np.array([x[2] for x in batch])).to(self.device)
+            value_batch = torch.FloatTensor(np.array([x[3] for x in batch]).astype(np.float32)).unsqueeze(1).to(self.device)
 
-            logits, values = self.model(state_batch)
+            logits, values = self.model(state_batch, action_mask=mask_batch)
             
             policy_loss = -torch.sum(prob_batch * F.log_softmax(logits, dim=1), dim=1).mean()
             value_loss = F.mse_loss(values, value_batch)

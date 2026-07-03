@@ -33,7 +33,7 @@ def _worker_play_game(args):
     while not terminal and step < config['max_steps']:
         temp = 1.0 if step < config['temp_moves'] else 0.0
         action_probs = mcts.get_action_prob(env, temperature=temp)
-        game_history.append((env.get_observation(), action_probs, env.current_player))
+        game_history.append((env.get_observation(), env.get_legal_action_mask(), action_probs, env.current_player))
 
         legal_mask = env.get_legal_action_mask()
         legal_actions = np.flatnonzero(legal_mask)
@@ -64,9 +64,9 @@ def _worker_play_game(args):
         winner = 1 if (reward == 1.0 and env.current_player == 2) else 2
 
     processed = []
-    for obs, p, player in game_history:
+    for obs, mask, p, player in game_history:
         z = 0.0 if winner is None else (1.0 if player == winner else -1.0)
-        processed.append((obs, p, z))
+        processed.append((obs, mask, p, z))
 
     return processed, terminal, step
 """

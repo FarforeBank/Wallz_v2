@@ -26,6 +26,15 @@ class MCTS:
         root = Node(prior=1.0)
         self._expand(root, env)
 
+        # Inject Dirichlet Noise for exploration
+        dirichlet_alpha = 0.3
+        epsilon = 0.25
+        legal_actions = list(root.children.keys())
+        if len(legal_actions) > 0:
+            noise = np.random.dirichlet([dirichlet_alpha] * len(legal_actions))
+            for i, action in enumerate(legal_actions):
+                root.children[action].prior = root.children[action].prior * (1 - epsilon) + noise[i] * epsilon
+
         for _ in range(self.num_simulations):
             node = root
             sim_env = copy.deepcopy(env)
