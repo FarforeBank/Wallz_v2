@@ -77,12 +77,22 @@ def _worker_play_game(args):
         probs = np.zeros(209)
         probs[legal_actions] = action_probs[legal_actions]
         
-        # Жесткий запрет на возвращение в прошлые состояния
+        # БЫСТРЫЙ анти-цикл (сохранение и откат состояния вместо deepcopy)
         for act in legal_actions:
-            sim_env = copy.deepcopy(env)
-            sim_env.step(int(act))
-            if seen_states.get(state_key(sim_env), 0) >= config['rep_limit'] - 1:
+            # Сохраняем состояние
+            saved_p1, saved_p2, saved_cp = env.p1_pos, env.p2_pos, env.current_player
+            saved_wl = env.walls_left.copy()
+            saved_hw, saved_vw = env.h_walls.copy(), env.v_walls.copy()
+            
+            # Делаем тестовый шаг
+            env.step(int(act))
+            if seen_states.get(state_key(env), 0) >= config['rep_limit'] - 1:
                 probs[act] = 0.0
+                
+            # Откатываем назад
+            env.p1_pos, env.p2_pos, env.current_player = saved_p1, saved_p2, saved_cp
+            env.walls_left = saved_wl
+            env.h_walls, env.v_walls = saved_hw, saved_vw
                 
         total_prob = probs.sum()
         if total_prob <= 0:

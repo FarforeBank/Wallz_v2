@@ -30,21 +30,20 @@ class WallzAssistant:
         self.mcts = MCTS(self.model, num_simulations=50) 
 
     async def extract_board_state(self, page):
-        """
-        Восстанавливает состояние доски, читая историю ходов (алгебраическую нотацию)
-        прямо из боковой панели сайта, и проигрывает её во внутреннем движке.
-        """
         env = WallzEnv()
+        seen_states = {}
+        def state_key(e): return (e.p1_pos, e.p2_pos, e.current_player, e.walls_left[1], e.walls_left[2], e.h_walls.tobytes(), e.v_walls.tobytes())
+        seen_states[state_key(env)] = 1
         
         try:
             # 1. Собираем все ходы
             move_elements = await page.locator('ol > li span[style*="color: var(--color-ink)"]').all_inner_texts()
             
             if not move_elements:
-                return env
+                return env, seen_states
 
             # 2. Маппинг координат Wallz.gg (i->a, 9->1)
-            col_map = {'i': 0, 'h': 1, 'g': 2, 'f': 3, 'e': 4, 'd': 5, 'c': 6, 'b': 7, 'a': 8}
+            col_map = {'a': 0, 'b': 1, 'c': 2, 'd': 3, 'e': 4, 'f': 5, 'g': 6, 'h': 7, 'i': 8}
             row_map = {'9': 0, '8': 1, '7': 2, '6': 3, '5': 4, '4': 5, '3': 6, '2': 7, '1': 8}
 
             # 3. Проигрываем историю для синхронизации
@@ -60,13 +59,15 @@ class WallzAssistant:
                     # Для пешек координаты прямые (0-8)
                     action = move_to_action('MOVE', row_idx, col_idx)
                     env.step(action)
+                    key = state_key(env)
+                    seen_states[key] = seen_states.get(key, 0) + 1
                     
                 elif len(move_str) == 3:
                     # ИСПРАВЛЕНИЕ: Стены находятся между клетками.
                     # e1v означает стену между столбцами e(4) и f(3) и строками 1(8) и 2(7).
                     # В нашей матрице это индекс 3 по X и 7 по Y.
-                    wall_r = row_idx - 1
-                    wall_c = col_idx - 1
+                    wall_r = row_idx
+                    wall_c = col_idx
                     
                     # Пропускаем ошибочные парсинги (защита от крашей)
                     if wall_r < 0 or wall_r > 7 or wall_c < 0 or wall_c > 7:
@@ -78,11 +79,13 @@ class WallzAssistant:
                         action = move_to_action('WALL_V', wall_r, wall_c)
                         
                     env.step(action)
+                    key = state_key(env)
+                    seen_states[key] = seen_states.get(key, 0) + 1
                 
         except Exception as e:
             print(f"❌ Error parsing board history: {e}")
             
-        return env
+        return env, seen_states
 
     async def run(self):
         print("🚀 Booting Auto-Stealth Visual Assistant with Persistent Profile...")
@@ -141,9 +144,34 @@ class WallzAssistant:
                         if current_moves != last_processed_moves:
                             await page.evaluate("document.getElementById('az-status').innerText = '⏳ Thinking...'")
                             
-                            env = await self.extract_board_state(page)
-                            action_probs = self.mcts.get_action_prob(env, temperature=0.0)
-                            best_action = np.argmax(action_probs)
+                            env, seen_states = await self.extract_board_state(page)
+                            action_probs = self.mcts.get_action_prob(env, temperature=0.2)
+                            
+                            legal_mask = env.get_legal_action_mask()
+                            legal_actions = np.flatnonzero(legal_mask)
+                            probs = np.zeros(209)
+                            probs[legal_actions] = action_probs[legal_actions]
+                            
+                            def state_key(e): return (e.p1_pos, e.p2_pos, e.current_player, e.walls_left[1], e.walls_left[2], e.h_walls.tobytes(), e.v_walls.tobytes())
+                            
+                            # Блокируем ходы, которые возвращают в прошлую позицию
+                            for act in legal_actions:
+                                saved_p1, saved_p2, saved_cp = env.p1_pos, env.p2_pos, env.current_player
+                                saved_wl = env.walls_left.copy()
+                                saved_hw, saved_vw = env.h_walls.copy(), env.v_walls.copy()
+                                
+                                env.step(int(act))
+                                if seen_states.get(state_key(env), 0) >= 1:
+                                    probs[act] = 0.0
+                                    
+                                env.p1_pos, env.p2_pos, env.current_player = saved_p1, saved_p2, saved_cp
+                                env.walls_left = saved_wl
+                                env.h_walls, env.v_walls = saved_hw, saved_vw
+
+                            if probs.sum() > 0:
+                                best_action = int(np.argmax(probs))
+                            else:
+                                best_action = int(np.argmax(action_probs))
                             
                             move_type, (r, c) = action_to_move(best_action)
                             
