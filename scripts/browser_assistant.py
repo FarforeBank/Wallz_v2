@@ -1,8 +1,8 @@
 import sys
-import re
 import asyncio
 import numpy as np
 import torch
+import re
 from pathlib import Path
 from playwright.async_api import async_playwright
 
@@ -45,8 +45,9 @@ class WallzAssistant:
                 return env, seen_states
 
             # Regex to find all valid Quoridor moves: e.g., 'e2', 'e8v', 'c5h'
-            moves = re.findall(r'([a-i])([1-9])([hv]?)', history_text)
+            moves = re.findall(r'\b([a-i])([1-9])([hv]?)\b', history_text)
             
+            # Маппинг координат Wallz.gg (i->a, 9->1)
             col_map = {'a': 0, 'b': 1, 'c': 2, 'd': 3, 'e': 4, 'f': 5, 'g': 6, 'h': 7, 'i': 8}
             row_map = {'9': 0, '8': 1, '7': 2, '6': 3, '5': 4, '4': 5, '3': 6, '2': 7, '1': 8}
 
@@ -56,13 +57,17 @@ class WallzAssistant:
                 row_idx = row_map[r_char]
                 
                 if not w_char:
+                    # Для пешек координаты прямые (0-8)
                     action = move_to_action('MOVE', row_idx, col_idx)
                 else:
-                    # Direct coordinate mapping (Reverted the math bug)
+                    # Direct coordinate mapping
                     wall_r = row_idx
                     wall_c = col_idx
+                    
+                    # Пропускаем ошибочные парсинги (защита от крашей)
                     if wall_r < 0 or wall_r > 7 or wall_c < 0 or wall_c > 7:
                         continue
+                        
                     if w_char == 'h':
                         action = move_to_action('WALL_H', wall_r, wall_c)
                     elif w_char == 'v':
@@ -71,51 +76,6 @@ class WallzAssistant:
                 env.step(action)
                 key = state_key(env)
                 seen_states[key] = seen_states.get(key, 0) + 1
-                
-        except Exception as e:
-            print(f"❌ Error parsing board history: {e}")
-            
-        return env, seen_states
-
-            # 2. Маппинг координат Wallz.gg (i->a, 9->1)
-            col_map = {'a': 0, 'b': 1, 'c': 2, 'd': 3, 'e': 4, 'f': 5, 'g': 6, 'h': 7, 'i': 8}
-            row_map = {'9': 0, '8': 1, '7': 2, '6': 3, '5': 4, '4': 5, '3': 6, '2': 7, '1': 8}
-
-            # 3. Проигрываем историю для синхронизации
-            for move_str in move_elements:
-                move_str = move_str.strip().lower()
-                if not move_str: 
-                    continue
-
-                col_idx = col_map[move_str[0]]
-                row_idx = row_map[move_str[1]]
-                
-                if len(move_str) == 2:
-                    # Для пешек координаты прямые (0-8)
-                    action = move_to_action('MOVE', row_idx, col_idx)
-                    env.step(action)
-                    key = state_key(env)
-                    seen_states[key] = seen_states.get(key, 0) + 1
-                    
-                elif len(move_str) == 3:
-                    # ИСПРАВЛЕНИЕ: Стены находятся между клетками.
-                    # e1v означает стену между столбцами e(4) и f(3) и строками 1(8) и 2(7).
-                    # В нашей матрице это индекс 3 по X и 7 по Y.
-                    wall_r = row_idx - 1
-                    wall_c = col_idx
-                    
-                    # Пропускаем ошибочные парсинги (защита от крашей)
-                    if wall_r < 0 or wall_r > 7 or wall_c < 0 or wall_c > 7:
-                        continue
-                        
-                    if move_str[2] == 'h':
-                        action = move_to_action('WALL_H', wall_r, wall_c)
-                    elif move_str[2] == 'v':
-                        action = move_to_action('WALL_V', wall_r, wall_c)
-                        
-                    env.step(action)
-                    key = state_key(env)
-                    seen_states[key] = seen_states.get(key, 0) + 1
                 
         except Exception as e:
             print(f"❌ Error parsing board history: {e}")
@@ -290,6 +250,7 @@ class WallzAssistant:
                     pass
                 
                 await asyncio.sleep(0.5)
+
 if __name__ == "__main__":
     import nest_asyncio
     nest_asyncio.apply()
