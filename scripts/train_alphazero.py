@@ -99,9 +99,11 @@ def _worker_play_game(args):
     winner = None
     is_tiebreaker = False
 
-    if terminal:
-        winner = 1 if (reward == 1.0 and env.current_player == 2) else 2
+    # Если терминальное состояние И кто-то реально дошел до конца
+    if terminal and reward == 1.0:
+        winner = 1 if env.current_player == 2 else 2
     else:
+        # Если игра прервалась (повторения, лимит шагов или adjudicate)
         p1_dist = env._get_bfs_distance(env.p1_pos, 0)
         p2_dist = env._get_bfs_distance(env.p2_pos, 8)
         if p1_dist < p2_dist:
