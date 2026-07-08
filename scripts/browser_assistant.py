@@ -21,13 +21,13 @@ class WallzAssistant:
         self.device = torch.device('cpu')
         print(f"Loading AlphaZero model on: {self.device}")
         
-        # ИСПРАВЛЕНИЕ 1: Теперь 10 каналов и 10 блоков (как при обучении)
+        # Модель инициализируется под продвинутую архитектуру: 10 каналов и 10 Res-блоков
         self.model = WallzNet(num_channels=10, num_res_blocks=10, num_hidden=128).to(self.device) 
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.eval()
         
         try:
-            # ИСПРАВЛЕНИЕ 2: Пустой тензор для компилятора тоже должен иметь 10 каналов
+            # Трейсинг модели для ускорения инференса через JIT
             dummy_obs = torch.zeros(1, 10, 9, 9).to(self.device)
             dummy_mask = torch.ones(1, 209, dtype=torch.bool).to(self.device)
             self.model = torch.jit.trace(self.model, (dummy_obs, dummy_mask))
@@ -35,7 +35,7 @@ class WallzAssistant:
         except Exception as e:
             print(f"⚠️ JIT Compilation skipped due to error: {e}")
 
-        # По умолчанию ставим быстрый режим (потом поменяешь в браузере, если нужно)
+        # По умолчанию ставим быстрый режим (10 симуляций), скорость переключается в UI виджета
         self.mcts = MCTS(self.model, num_simulations=10)
 
     async def extract_board_state(self, page):
@@ -43,7 +43,8 @@ class WallzAssistant:
         seen_states = {}
         player_positions = {1: [(8, 4)], 2: [(0, 4)]}
         
-        def state_key(e): return (e.p1_pos, e.p2_pos, e.current_player, e.walls_left[1], e.walls_left[2], e.h_walls.tobytes(), e.v_walls.tobytes())
+        def state_key(e): 
+            return (e.p1_pos, e.p2_pos, e.current_player, e.walls_left[1], e.walls_left[2], e.h_walls.tobytes(), e.v_walls.tobytes())
         seen_states[state_key(env)] = 1
         
         try:
@@ -88,7 +89,7 @@ class WallzAssistant:
         return env, seen_states, player_positions
 
     async def run(self):
-        print("🚀 Booting Auto-Stealth Visual Assistant with Blitz Mode...")
+        print("🚀 Booting Auto-Stealth Visual Assistant with Dynamic Perspective...")
         
         profile_dir = ROOT_DIR / "wallz_v2" / "browser_profile"
         profile_dir.mkdir(parents=True, exist_ok=True)
@@ -105,6 +106,7 @@ class WallzAssistant:
             await page.goto("https://wallz.gg")
             print("\n✅ Browser open! UI injected.")
             
+            # JS для инъекции стильного виджета управления
             status_js = """
             () => {
                 if (!document.getElementById('az-widget')) {
@@ -143,7 +145,7 @@ class WallzAssistant:
                     
                     const select = document.createElement('select');
                     select.id = 'az-sim-select';
-                    select.style.appearance = 'select'; // Принудительный дефолтный вид
+                    select.style.appearance = 'select';
                     select.style.webkitAppearance = 'select';
                     select.style.backgroundColor = '#1e293b';
                     select.style.color = '#38bdf8';
@@ -171,7 +173,6 @@ class WallzAssistant:
                     controls.appendChild(select);
                     widget.appendChild(controls);
 
-                    // Переработанный блок Автокликера
                     const autoClickDiv = document.createElement('div');
                     autoClickDiv.style.display = 'flex';
                     autoClickDiv.style.alignItems = 'center';
@@ -180,7 +181,7 @@ class WallzAssistant:
                     const cb = document.createElement('input');
                     cb.type = 'checkbox';
                     cb.id = 'az-autoclick';
-                    cb.style.appearance = 'checkbox'; // Принудительный дефолтный вид
+                    cb.style.appearance = 'checkbox';
                     cb.style.webkitAppearance = 'checkbox';
                     cb.style.width = '14px';
                     cb.style.height = '14px';
@@ -202,7 +203,6 @@ class WallzAssistant:
             """
             
             last_processed_moves = -1
-            
             col_map = {'a': 0, 'b': 1, 'c': 2, 'd': 3, 'e': 4, 'f': 5, 'g': 6, 'h': 7, 'i': 8}
             row_map = {'9': 0, '8': 1, '7': 2, '6': 3, '5': 4, '4': 5, '3': 6, '2': 7, '1': 8}
             col_map_inv = {v: k for k, v in col_map.items()}
@@ -221,24 +221,28 @@ class WallzAssistant:
                         if current_moves != last_processed_moves:
                             await page.evaluate("document.getElementById('az-text').innerText = '⏳ Thinking...'")
                             
+                            # 1. Парсим абсолютное состояние игры из истории ходов сайта
                             env, seen_states, player_positions = await self.extract_board_state(page)
                             
+                            # Обновляем количество симуляций на основе выбора в виджете
                             ui_sims = await page.evaluate("() => { const el = document.getElementById('az-sim-select'); return el ? parseInt(el.value) : null; }")
                             if ui_sims and ui_sims != self.mcts.num_simulations:
                                 self.mcts.num_simulations = ui_sims
                                 print(f"⚙️ AI Strength updated to {ui_sims} simulations")
                             
-                            my_id = env.current_player
-                            recent_history = set(player_positions[my_id][-4:])
-                            
-                            action_probs = self.mcts.get_action_prob(env, temperature=0.2)
+                            # Рассчитываем лучшие вероятности ходов через дерево MCTS
+                            action_probs = self.mcts.get_action_prob(env, temperature=0.1)
                             
                             legal_mask = env.get_legal_action_mask()
                             legal_actions = np.flatnonzero(legal_mask)
                             probs = np.zeros(209)
                             probs[legal_actions] = action_probs[legal_actions] + 1e-6
                             
-                            def state_key(e): return (e.p1_pos, e.p2_pos, e.current_player, e.walls_left[1], e.walls_left[2], e.h_walls.tobytes(), e.v_walls.tobytes())
+                            # Применяем фильтр анти-цикла и защиты от повторения позиций
+                            my_id = env.current_player
+                            recent_history = set(player_positions[my_id][-4:])
+                            def state_key(e): 
+                                return (e.p1_pos, e.p2_pos, e.current_player, e.walls_left[1], e.walls_left[2], e.h_walls.tobytes(), e.v_walls.tobytes())
                             
                             for act in legal_actions:
                                 saved_p1, saved_p2, saved_cp = env.p1_pos, env.p2_pos, env.current_player
@@ -246,14 +250,11 @@ class WallzAssistant:
                                 saved_hw, saved_vw = env.h_walls.copy(), env.v_walls.copy()
                                 
                                 move_type, (r, c) = action_to_move(act)
-                                
-                                if move_type == 'MOVE':
-                                    if (r, c) in recent_history:
-                                        probs[act] = 0.0 
+                                if move_type == 'MOVE' and (r, c) in recent_history:
+                                    probs[act] = 0.0 
                                 
                                 env.step(int(act))
                                 key = state_key(env)
-                                
                                 if seen_states.get(key, 0) >= 1:
                                     probs[act] = 0.0
                                         
@@ -270,6 +271,7 @@ class WallzAssistant:
                             
                             move_type, (r, c) = action_to_move(best_action)
                             
+                            # Перевод координат в текстовые метки
                             if move_type == 'MOVE':
                                 hint_c_char = col_map_inv[c]
                                 hint_r_char = row_map_inv[r]
@@ -277,6 +279,7 @@ class WallzAssistant:
                                 hint_c_char = col_map_inv[c]
                                 hint_r_char = row_map_inv[r + 1]
                             
+                            # Динамический JS-рендеринг подсказки на основе текущей развертки шкал сайта
                             highlight_js = f"""
                             () => {{
                                 const svg = document.querySelector('svg[aria-label="Wallz board"]');
@@ -293,6 +296,7 @@ class WallzAssistant:
                                 const cChar = '{hint_c_char}';
                                 const rChar = '{hint_r_char}';
 
+                                // КЛЮЧЕВОЙ ФИКС: Считываем буквы и цифры прямо со шкал экрана, подстраиваясь под разворот камеры сайтом
                                 const cols = Array.from(document.querySelectorAll('text[y="660"]')).map(t => t.textContent.trim().toLowerCase());
                                 const rows = Array.from(document.querySelectorAll('text[x="-24"]')).map(t => t.textContent.trim().toLowerCase());
 
@@ -317,7 +321,6 @@ class WallzAssistant:
                                     rect.setAttribute('stroke', '#38bdf8');
                                     rect.setAttribute('stroke-width', 4);
                                     
-                                    // Центр клетки
                                     click_x = svgRect.left + (vis_c * 72) + 30;
                                     click_y = svgRect.top + (vis_r * 72) + 30;
                                 }} else {{
@@ -340,7 +343,6 @@ class WallzAssistant:
                                     rect.setAttribute('fill', 'rgba(250, 204, 21, 0.8)');
                                     rect.setAttribute('stroke', '#facc15');
                                     
-                                    // Центр стены (перекрестие)
                                     click_x = svgRect.left + (vis_c * 72) + 66;
                                     click_y = svgRect.top + (vis_r * 72) + 66;
                                 }}
@@ -360,12 +362,12 @@ class WallzAssistant:
                             """
                             coords = await page.evaluate(highlight_js)
                             await page.evaluate("document.getElementById('az-text').innerText = '👑 Move Ready!'")
-                            print(f"Move {current_moves + 1} -> {move_type} at {hint_c_char}{hint_r_char} (MCTS: {self.mcts.num_simulations})")
+                            print(f"Move {current_moves + 1} -> {move_type} at {hint_c_char}{hint_r_char}")
                             
-                            # Блок автоклика
+                            # Блок автокликера
                             auto_click = await page.evaluate("() => { const el = document.getElementById('az-autoclick'); return el ? el.checked : false; }")
                             if auto_click and coords:
-                                await asyncio.sleep(0.02) # Микрозадержка для рендера
+                                await asyncio.sleep(0.02)
                                 await page.mouse.click(coords['x'], coords['y'])
                             
                             last_processed_moves = current_moves
@@ -379,8 +381,7 @@ class WallzAssistant:
                             
                 except Exception as e:
                     pass
-                
-                await asyncio.sleep(0.05) # Снизили задержку цикла до 50мс
+                await asyncio.sleep(0.05)
 
 if __name__ == "__main__":
     import nest_asyncio

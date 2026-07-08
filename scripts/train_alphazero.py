@@ -20,7 +20,6 @@ if str(ROOT_DIR) not in sys.path:
 
 from wallz_v2.env.wallz_env import WallzEnv
 from wallz_v2.agents.model import WallzNet
-# Импортируем новые функции из MCTS
 from wallz_v2.agents.mcts import MCTS, invert_action_array, flip_action_array_horizontal, flip_obs_horizontal
 
 
@@ -63,9 +62,6 @@ def _worker_play_game(args):
     step = 0
 
     while not terminal and step < config['max_steps']:
-        
-        # --- Playout Cap Randomization (PCR) ---
-        # 25% времени полная глубина, 75% - быстрый "интуитивный" ход
         if np.random.rand() < 0.25:
             mcts.num_simulations = config['mcts_simulations']
         else:
@@ -74,7 +70,6 @@ def _worker_play_game(args):
         temp = 1.0 if step < config['temp_moves'] else 0.0
         action_probs = mcts.get_action_prob(env, temperature=temp)
         
-        # --- Data Augmentation & Canonical View ---
         obs = env.get_observation()
         mask = env.get_legal_action_mask()
         
@@ -83,9 +78,7 @@ def _worker_play_game(args):
             c_mask = invert_action_array(mask)
             c_probs = invert_action_array(action_probs)
             
-            # Сохраняем оригинал (приведенный к каноническому виду)
             game_history.append((c_obs, c_mask, c_probs, env.current_player))
-            # Сохраняем зеркальную копию (x2 данных из воздуха!)
             game_history.append((flip_obs_horizontal(c_obs), flip_action_array_horizontal(c_mask), flip_action_array_horizontal(c_probs), env.current_player))
         else:
             game_history.append((obs, mask, action_probs, env.current_player))
@@ -96,7 +89,6 @@ def _worker_play_game(args):
         probs = np.zeros(209)
         probs[legal_actions] = action_probs[legal_actions]
         
-        # Анти-цикл
         for act in legal_actions:
             saved_p1, saved_p2, saved_cp = env.p1_pos, env.p2_pos, env.current_player
             saved_wl = env.walls_left.copy()
@@ -146,15 +138,19 @@ def _worker_play_game(args):
             is_tiebreaker = True
 
     processed = []
-    for obs, mask, p, player in game_history:
+    total_steps_in_game = len(game_history)
+    for current_step_idx, (obs, mask, p, player) in enumerate(game_history):
         if winner is None:
             z = 0.0
         else:
             base_z = 1.0 if player == winner else -1.0
-            z = base_z * 0.1 if is_tiebreaker else base_z
+            steps_to_end = total_steps_in_game - current_step_idx
+            z = base_z * (0.99 ** steps_to_end) 
+            z = z * 0.1 if is_tiebreaker else z
         processed.append((obs, mask, p, z))
 
     return processed, terminal, step
+
 
 class AlphaZeroTrainer:
     def __init__(self):
@@ -165,16 +161,22 @@ class AlphaZeroTrainer:
         print(f"Using device: {self.device}")
 
         self.model = WallzNet().to(self.device)
+        
+        # Начальный оптимизатор (будет динамически корректироваться)
         self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3, weight_decay=1e-4)
 
-        self.epochs = env_int("AZ_EPOCHS", 50)
+        # Ставим общий предел в 100 эпох
+        self.epochs = env_int("AZ_EPOCHS", 100)
         self.games_per_epoch = env_int("AZ_GAMES_PER_EPOCH", 10)
-        self.mcts_simulations = env_int("AZ_MCTS_SIMULATIONS", 30)
+        
+        # Базовые значения до 50 эпохи
+        self.mcts_simulations = 30
+        self.temperature_moves = 40
+        
         self.batch_size = env_int("AZ_BATCH_SIZE", 128)
         self.save_every = env_int("AZ_SAVE_EVERY", 1)
         self.min_terminal_games = env_int("AZ_MIN_TERMINAL_GAMES", 1)
         self.max_steps_per_game = env_int("AZ_MAX_STEPS_PER_GAME", 120)
-        self.temperature_moves = env_int("AZ_TEMPERATURE_MOVES", 40)
         self.repetition_limit = env_int("AZ_REPETITION_LIMIT", 3)
         self.show_progress = env_flag("AZ_PROGRESS", True)
         
@@ -204,8 +206,27 @@ class AlphaZeroTrainer:
             print(f"Resuming after epoch {epoch}.")
             return epoch
         except RuntimeError:
-            print("⚠️ Checkpoint architecture mismatch! The old model is incompatible with the new ResNet. Starting from scratch.")
+            print("⚠️ Checkpoint architecture mismatch! Starting from scratch.")
             return 0
+
+    def _apply_dynamic_scheduler(self, epoch):
+        """Динамический шедулер параметров для перехода в Fine-Tuning."""
+        if epoch <= 50:
+            # Стандартный режим (доигрываем 10 эпох до полных 50)
+            current_lr = 1e-3
+            self.mcts_simulations = 30
+            self.temperature_moves = 40
+        else:
+            # ГРОССМЕЙСТЕРСКИЙ FINE-TUNING (Эпохи 51-100)
+            current_lr = 1e-4  # Снижаем скорость обучения в 10 раз
+            self.mcts_simulations = 150  # Мощнейшая глубина просчета
+            self.temperature_moves = 12  # Убираем хаос в дебютах
+            
+        # Обновляем скорость в оптимизаторе без потери накопленных моментов Adam
+        for param_group in self.optimizer.param_groups:
+            if param_group['lr'] != current_lr:
+                param_group['lr'] = current_lr
+                tqdm.write(f"⚙️ Dynamic Scheduler Triggered! Epoch {epoch}: LR -> {current_lr}, MCTS -> {self.mcts_simulations}, TempMoves -> {self.temperature_moves}")
 
     def save_checkpoint(self, epoch: int, interrupted: bool = False):
         name = f"alphazero_interrupt_epoch_{epoch}.pt" if interrupted else f"alphazero_epoch_{epoch}.pt"
@@ -282,10 +303,14 @@ class AlphaZeroTrainer:
 
     def learn(self):
         final_epoch = self.start_epoch + self.epochs - 1
-        epoch_iter = tqdm(range(self.start_epoch, final_epoch + 1), total=self.epochs, desc="AlphaZero ResNet", dynamic_ncols=True)
+        epoch_iter = tqdm(range(self.start_epoch, 101), total=(101 - self.start_epoch), desc="AlphaZero ResNet", dynamic_ncols=True)
 
         for epoch in epoch_iter:
             self.current_epoch = epoch
+            
+            # ВЫЗОВ ДИНАМИЧЕСКОГО ШЕДУЛЕРА ПЕРЕД СТАРТОМ ЭПОХЫ
+            self._apply_dynamic_scheduler(epoch)
+            
             stats = self.self_play()
             losses = self.train_network(stats["completed_games"])
 
@@ -299,6 +324,7 @@ class AlphaZeroTrainer:
 
             if epoch % self.save_every == 0:
                 self.save_checkpoint(epoch)
+
 
 if __name__ == '__main__':
     import multiprocessing
