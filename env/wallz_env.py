@@ -135,25 +135,36 @@ class WallzEnv:
         return valid
 
     def get_observation(self):
-        """Constructs an 8-channel full spatial matrix tensor plane (8, 9, 9) representing absolute space."""
-        obs = np.zeros((8, 9, 9), dtype=np.float32)
+        """Constructs a 10-channel full spatial matrix tensor."""
+        # ТЕПЕРЬ 10 КАНАЛОВ!
+        obs = np.zeros((10, 9, 9), dtype=np.float32)
         
-        # Setup views centered cleanly around current turn perspectivism
         cp = self.current_player
         curr_pos = (self.p1_pos[1], self.p1_pos[0]) if cp == 1 else (self.p2_pos[1], self.p2_pos[0])
         opp_pos = (self.p2_pos[1], self.p2_pos[0]) if cp == 1 else (self.p1_pos[1], self.p1_pos[0])
         
-        obs[0, curr_pos[0], curr_pos[1]] = 1.0  # CH 0: Current Player coordinates
-        obs[1, opp_pos[0], opp_pos[1]] = 1.0    # CH 1: Opponent coordinates
+        obs[0, curr_pos[0], curr_pos[1]] = 1.0  
+        obs[1, opp_pos[0], opp_pos[1]] = 1.0    
         
-        obs[2, :8, :8] = self.h_walls           # CH 2: Horizontal layouts mapped
-        obs[3, :8, :8] = self.v_walls           # CH 3: Vertical layouts mapped
+        obs[2, :8, :8] = self.h_walls           
+        obs[3, :8, :8] = self.v_walls           
         
-        obs[4, (0 if cp == 1 else 8), :] = 1.0  # CH 4: Self goal lane
-        obs[5, (8 if cp == 1 else 0), :] = 1.0  # CH 5: Target opponent goal lane
+        obs[4, (0 if cp == 1 else 8), :] = 1.0  
+        obs[5, (8 if cp == 1 else 0), :] = 1.0  
         
-        obs[6, :, :] = self.walls_left[cp] / 10.0      # CH 6: Player wall balance plane
-        obs[7, :, :] = self.walls_left[3 - cp] / 10.0  # CH 7: Enemy wall balance plane
+        obs[6, :, :] = self.walls_left[cp] / 10.0      
+        obs[7, :, :] = self.walls_left[3 - cp] / 10.0  
+        
+        # --- НОВЫЕ КАНАЛЫ (BFS Расстояния) ---
+        # Вычисляем реальные дистанции (ограничиваем 81, чтобы не сломать нормализацию при полном блоке)
+        dist_cp = min(81, self._get_bfs_distance(self.p1_pos if cp == 1 else self.p2_pos, 0 if cp == 1 else 8))
+        dist_opp = min(81, self._get_bfs_distance(self.p2_pos if cp == 1 else self.p1_pos, 8 if cp == 1 else 0))
+        
+        # Заливаем 8-й и 9-й слои нормализованными значениями (от 0 до 1)
+        # Нейросеть сможет буквально "видеть" длину пути
+        obs[8, :, :] = dist_cp / 81.0
+        obs[9, :, :] = dist_opp / 81.0
+        
         return obs
 
     def get_legal_action_mask(self):
