@@ -21,20 +21,22 @@ class WallzAssistant:
         self.device = torch.device('cpu')
         print(f"Loading AlphaZero model on: {self.device}")
         
-        self.model = WallzNet(num_channels=8, num_res_blocks=5, num_hidden=128).to(self.device) 
+        # ИСПРАВЛЕНИЕ 1: Теперь 10 каналов и 10 блоков (как при обучении)
+        self.model = WallzNet(num_channels=10, num_res_blocks=10, num_hidden=128).to(self.device) 
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.eval()
         
         try:
-            dummy_obs = torch.zeros(1, 8, 9, 9).to(self.device)
+            # ИСПРАВЛЕНИЕ 2: Пустой тензор для компилятора тоже должен иметь 10 каналов
+            dummy_obs = torch.zeros(1, 10, 9, 9).to(self.device)
             dummy_mask = torch.ones(1, 209, dtype=torch.bool).to(self.device)
             self.model = torch.jit.trace(self.model, (dummy_obs, dummy_mask))
             print("⚡ PyTorch JIT Compilation successful! Model is optimized.")
         except Exception as e:
             print(f"⚠️ JIT Compilation skipped due to error: {e}")
 
-        # По умолчанию ставим быстрый режим
-        self.mcts = MCTS(self.model, num_simulations=10) 
+        # По умолчанию ставим быстрый режим (потом поменяешь в браузере, если нужно)
+        self.mcts = MCTS(self.model, num_simulations=10)
 
     async def extract_board_state(self, page):
         env = WallzEnv()
@@ -111,12 +113,12 @@ class WallzAssistant:
                     widget.style.position = 'fixed';
                     widget.style.bottom = '15px';
                     widget.style.right = '15px';
-                    widget.style.zIndex = '999999';
-                    widget.style.backgroundColor = 'rgba(15, 23, 42, 0.9)';
-                    widget.style.border = '1px solid #334155';
+                    widget.style.zIndex = '9999999';
+                    widget.style.backgroundColor = '#0f172a';
+                    widget.style.border = '2px solid #334155';
                     widget.style.borderRadius = '10px';
                     widget.style.padding = '12px 16px';
-                    widget.style.boxShadow = '0 10px 15px -3px rgba(0, 0, 0, 0.5)';
+                    widget.style.boxShadow = '0 10px 15px -3px rgba(0, 0, 0, 0.7)';
                     widget.style.fontFamily = 'monospace';
                     widget.style.fontSize = '13px';
                     widget.style.pointerEvents = 'auto';
@@ -133,6 +135,7 @@ class WallzAssistant:
                     controls.style.display = 'flex';
                     controls.style.alignItems = 'center';
                     controls.style.gap = '8px';
+                    controls.style.marginBottom = '10px';
                     
                     const label = document.createElement('span');
                     label.innerText = 'Power:';
@@ -140,12 +143,13 @@ class WallzAssistant:
                     
                     const select = document.createElement('select');
                     select.id = 'az-sim-select';
+                    select.style.appearance = 'select'; // Принудительный дефолтный вид
+                    select.style.webkitAppearance = 'select';
                     select.style.backgroundColor = '#1e293b';
                     select.style.color = '#38bdf8';
                     select.style.border = '1px solid #475569';
                     select.style.borderRadius = '4px';
-                    select.style.padding = '2px 4px';
-                    select.style.outline = 'none';
+                    select.style.padding = '4px 8px';
                     select.style.cursor = 'pointer';
                     
                     const options = [
@@ -167,21 +171,24 @@ class WallzAssistant:
                     controls.appendChild(select);
                     widget.appendChild(controls);
 
-                    // Галочка для Автокликера
+                    // Переработанный блок Автокликера
                     const autoClickDiv = document.createElement('div');
-                    autoClickDiv.style.marginTop = '10px';
                     autoClickDiv.style.display = 'flex';
                     autoClickDiv.style.alignItems = 'center';
+                    autoClickDiv.style.gap = '6px';
                     
                     const cb = document.createElement('input');
                     cb.type = 'checkbox';
                     cb.id = 'az-autoclick';
+                    cb.style.appearance = 'checkbox'; // Принудительный дефолтный вид
+                    cb.style.webkitAppearance = 'checkbox';
+                    cb.style.width = '14px';
+                    cb.style.height = '14px';
                     cb.style.cursor = 'pointer';
                     
                     const cbLabel = document.createElement('label');
-                    cbLabel.innerText = ' Auto-Click (Bot Plays)';
-                    cbLabel.style.color = '#f87171'; // Красный цвет для предупреждения
-                    cbLabel.style.marginLeft = '6px';
+                    cbLabel.innerText = 'Auto-Click (Bot Plays)';
+                    cbLabel.style.color = '#f87171';
                     cbLabel.style.cursor = 'pointer';
                     cbLabel.htmlFor = 'az-autoclick';
                     
