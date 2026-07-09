@@ -235,19 +235,38 @@ class WallzAssistant:
                             def state_key(e): 
                                 return (e.p1_pos, e.p2_pos, e.current_player, e.walls_left[1], e.walls_left[2], e.h_walls.tobytes(), e.v_walls.tobytes())
                             
+                            # --- НОВЫЙ БЛОК: Замеряем текущую дистанцию до финиша ---
+                            target_row = 0 if my_id == 1 else 8
+                            current_pos = env.p1_pos if my_id == 1 else env.p2_pos
+                            current_dist = env._get_bfs_distance(current_pos, target_row)
+                            
                             for act in legal_actions:
                                 saved_p1, saved_p2, saved_cp = env.p1_pos, env.p2_pos, env.current_player
                                 saved_wl = env.walls_left.copy()
                                 saved_hw, saved_vw = env.h_walls.copy(), env.v_walls.copy()
                                 
                                 move_type, (r, c) = action_to_move(act)
-                                if move_type == 'MOVE' and (r, c) in recent_history:
-                                    probs[act] *= 0.1 
                                 
                                 env.step(int(act))
                                 key = state_key(env)
                                 
-                                # Разрешаем наступить на клетку дважды, но обрезаем зацикливание
+                                # --- ЭВРИСТИКА ПРОГРЕССИИ (Лечим "танцы" на месте) ---
+                                if move_type == 'MOVE':
+                                    new_pos = env.p1_pos if my_id == 1 else env.p2_pos
+                                    new_dist = env._get_bfs_distance(new_pos, target_row)
+                                    
+                                    if new_dist < current_dist:
+                                        probs[act] *= 2.0    # Мощно поощряем шаг вперед
+                                    elif new_dist == current_dist:
+                                        probs[act] *= 0.1    # Штрафуем шаги вбок (танцы)
+                                    else:
+                                        probs[act] *= 0.01   # Жестко штрафуем шаги назад
+                                        
+                                    # Жесткий запрет на возврат в недавние позиции
+                                    if (r, c) in recent_history:
+                                        probs[act] *= 0.001 
+                                
+                                # Обрезаем глобальное зацикливание
                                 if seen_states.get(key, 0) >= 2:
                                     probs[act] = 0.0
                                         
@@ -255,6 +274,7 @@ class WallzAssistant:
                                 env.walls_left = saved_wl
                                 env.h_walls, env.v_walls = saved_hw, saved_vw
 
+                            # Если все хорошие ходы заблокировались (чтобы не словить краш)
                             if probs.sum() > 0:
                                 best_action = int(np.argmax(probs))
                             else:
