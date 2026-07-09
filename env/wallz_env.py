@@ -13,12 +13,24 @@ class WallzEnv:
         self.h_walls = np.zeros((8, 8), dtype=bool)
         self.v_walls = np.zeros((8, 8), dtype=bool)
 
-        self.p1_pos = (4, 8)  # Player 1 starts at bottom row (x=4, y=8)
-        self.p2_pos = (4, 0)  # Player 2 starts at top row (x=4, y=0)
+        self.p1_pos = (4, 8)  
+        self.p2_pos = (4, 0)  
 
         self.current_player = 1
         self.walls_left = {1: 10, 2: 10}
         return self.get_observation(), self.get_legal_action_mask()
+
+    def clone(self):
+        """Супер-быстрое ручное копирование среды вместо тормозного deepcopy."""
+        new_env = WallzEnv.__new__(WallzEnv) 
+        new_env.board_size = self.board_size
+        new_env.h_walls = self.h_walls.copy()
+        new_env.v_walls = self.v_walls.copy()
+        new_env.p1_pos = self.p1_pos
+        new_env.p2_pos = self.p2_pos
+        new_env.current_player = self.current_player
+        new_env.walls_left = self.walls_left.copy()
+        return new_env
 
     def _in_bounds(self, x, y):
         return 0 <= x < self.board_size and 0 <= y < self.board_size
@@ -29,13 +41,13 @@ class WallzEnv:
         if abs(x1 - x2) + abs(y1 - y2) != 1:
             return True
 
-        if x1 == x2:  # Vertical pawn movement: check horizontal blocking barriers
+        if x1 == x2:  
             y_min = min(y1, y2)
             if x1 < 8 and self.h_walls[y_min, x1]:
                 return True
             if x1 > 0 and self.h_walls[y_min, x1 - 1]:
                 return True
-        elif y1 == y2:  # Horizontal pawn movement: check vertical blocking barriers
+        elif y1 == y2:  
             x_min = min(x1, x2)
             if y1 < 8 and self.v_walls[y1, x_min]:
                 return True
@@ -44,7 +56,6 @@ class WallzEnv:
         return False
 
     def _get_valid_moves(self, player_id):
-        """Your full engine jump and diagonal tracking logic integrated into (row, col) coordinates."""
         cx, cy = self.p1_pos if player_id == 1 else self.p2_pos
         ox, oy = self.p2_pos if player_id == 1 else self.p1_pos
         moves = []
@@ -58,20 +69,17 @@ class WallzEnv:
                 moves.append((ax, ay))
                 continue
 
-            # Straight jump sequence if opponent is blocking the path
             jx, jy = ax + dx, ay + dy
             if self._in_bounds(jx, jy) and not self.has_wall_between(ax, ay, jx, jy):
                 moves.append((jx, jy))
                 continue
 
-            # Diagonal bypass rule when straight jumps are obstructed
             perpendicular = [(-1, 0), (1, 0)] if dx == 0 else [(0, -1), (0, 1)]
             for pdx, pdy in perpendicular:
                 tx, ty = ax + pdx, ay + pdy
                 if self._in_bounds(tx, ty) and not self.has_wall_between(ax, ay, tx, ty):
                     moves.append((tx, ty))
 
-        # Re-map (x, y) engine tracking into standard internal structural matrix layout: (row=y, col=x)
         seen = set()
         unique_rc_moves = []
         for x, y in moves:
@@ -123,7 +131,6 @@ class WallzEnv:
         if not self._wall_slot_is_free(r, c, orientation):
             return False
 
-        # Temporarily anchor the wall matrix configuration to validate valid pathways
         if orientation == "H":
             self.h_walls[r, c] = True
             valid = self._has_path(1) and self._has_path(2)
@@ -135,8 +142,6 @@ class WallzEnv:
         return valid
 
     def get_observation(self):
-        """Constructs a 10-channel full spatial matrix tensor."""
-        # ТЕПЕРЬ 10 КАНАЛОВ!
         obs = np.zeros((10, 9, 9), dtype=np.float32)
         
         cp = self.current_player
@@ -155,13 +160,9 @@ class WallzEnv:
         obs[6, :, :] = self.walls_left[cp] / 10.0      
         obs[7, :, :] = self.walls_left[3 - cp] / 10.0  
         
-        # --- НОВЫЕ КАНАЛЫ (BFS Расстояния) ---
-        # Вычисляем реальные дистанции (ограничиваем 81, чтобы не сломать нормализацию при полном блоке)
         dist_cp = min(81, self._get_bfs_distance(self.p1_pos if cp == 1 else self.p2_pos, 0 if cp == 1 else 8))
         dist_opp = min(81, self._get_bfs_distance(self.p2_pos if cp == 1 else self.p1_pos, 8 if cp == 1 else 0))
         
-        # Заливаем 8-й и 9-й слои нормализованными значениями (от 0 до 1)
-        # Нейросеть сможет буквально "видеть" длину пути
         obs[8, :, :] = dist_cp / 81.0
         obs[9, :, :] = dist_opp / 81.0
         
@@ -170,12 +171,10 @@ class WallzEnv:
     def get_legal_action_mask(self):
         mask = np.zeros(TOTAL_ACTIONS, dtype=bool)
         
-        # 1. Map absolute valid pawn row-col destinations (0-80)
         valid_moves = self._get_valid_moves(self.current_player)
         for r, c in valid_moves:
             mask[r * 9 + c] = True
             
-        # 2. Map absolute valid wall coordinate anchors if budget permits
         if self.walls_left[self.current_player] > 0:
             for r in range(8):
                 for c in range(8):
@@ -189,7 +188,6 @@ class WallzEnv:
         move_type, (r, c) = action_to_move(action)
         
         if move_type == 'MOVE':
-            # Decode matrix indices (row=r, col=c) back into engine (x=col, y=row) layout
             new_pos = (c, r)
             if self.current_player == 1:
                 self.p1_pos = new_pos
@@ -205,7 +203,6 @@ class WallzEnv:
         reward = 0.0
         terminal = False
         
-        # Check finish line benchmarks
         if self.p1_pos[1] == 0:
             reward = 1.0 if self.current_player == 1 else -1.0
             terminal = True

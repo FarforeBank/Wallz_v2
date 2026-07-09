@@ -20,8 +20,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from wallz_v2.env.wallz_env import WallzEnv
 from wallz_v2.agents.model import WallzNet
-from wallz_v2.agents.mcts import MCTS, invert_action_array, flip_action_array_horizontal, flip_obs_horizontal
-
+from wallz_v2.agents.mcts import MCTS, invert_action_array, flip_action_array_horizontal, flip_obs_horizontal, get_canonical_obs
 
 def env_int(name: str, default: int) -> int:
     value = os.getenv(name)
@@ -33,13 +32,11 @@ def env_int(name: str, default: int) -> int:
         return default
     return parsed if parsed >= 0 else default
 
-
 def env_flag(name: str, default: bool = True) -> bool:
     value = os.getenv(name)
     if value is None:
         return default
     return value.strip().lower() not in {"0", "false", "no", "off"}
-
 
 def _worker_play_game(args):
     state_dict, config, game_idx = args
@@ -74,7 +71,7 @@ def _worker_play_game(args):
         mask = env.get_legal_action_mask()
         
         if env.current_player == 2:
-            c_obs = np.rot90(obs, k=2, axes=(1, 2)).copy()
+            c_obs = get_canonical_obs(obs)
             c_mask = invert_action_array(mask)
             c_probs = invert_action_array(action_probs)
             
@@ -124,18 +121,25 @@ def _worker_play_game(args):
 
     winner = None
     is_tiebreaker = False
+    base_reward = 0.0
 
     if terminal and reward == 1.0:
         winner = 1 if env.current_player == 2 else 2
+        base_reward = 1.0
     else:
         p1_dist = env._get_bfs_distance(env.p1_pos, 0)
         p2_dist = env._get_bfs_distance(env.p2_pos, 8)
+        
         if p1_dist < p2_dist:
             winner = 1
             is_tiebreaker = True
         elif p2_dist < p1_dist:
             winner = 2
             is_tiebreaker = True
+            
+        if winner is not None:
+            diff = abs(p1_dist - p2_dist)
+            base_reward = min(1.0, diff * 0.15)
 
     processed = []
     total_steps_in_game = len(game_history)
@@ -143,10 +147,12 @@ def _worker_play_game(args):
         if winner is None:
             z = 0.0
         else:
-            base_z = 1.0 if player == winner else -1.0
-            steps_to_end = total_steps_in_game - current_step_idx
-            z = base_z * (0.99 ** steps_to_end) 
-            z = z * 0.1 if is_tiebreaker else z
+            sign = 1.0 if player == winner else -1.0
+            if is_tiebreaker:
+                z = sign * base_reward
+            else:
+                steps_to_end = total_steps_in_game - current_step_idx
+                z = sign * base_reward * (0.99 ** steps_to_end) 
         processed.append((obs, mask, p, z))
 
     return processed, terminal, step
@@ -161,17 +167,13 @@ class AlphaZeroTrainer:
         print(f"Using device: {self.device}")
 
         self.model = WallzNet().to(self.device)
-        
-        # Начальный оптимизатор (будет динамически корректироваться)
         self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3, weight_decay=1e-4)
 
-        # Ставим общий предел в 100 эпох
         self.epochs = env_int("AZ_EPOCHS", 100)
         self.games_per_epoch = env_int("AZ_GAMES_PER_EPOCH", 10)
         
-        # Базовые значения до 50 эпохи
         self.mcts_simulations = 30
-        self.temperature_moves = 40
+        self.temperature_moves = 15 
         
         self.batch_size = env_int("AZ_BATCH_SIZE", 128)
         self.save_every = env_int("AZ_SAVE_EVERY", 1)
@@ -210,19 +212,15 @@ class AlphaZeroTrainer:
             return 0
 
     def _apply_dynamic_scheduler(self, epoch):
-        """Динамический шедулер параметров для перехода в Fine-Tuning."""
         if epoch <= 50:
-            # Стандартный режим (доигрываем 10 эпох до полных 50)
             current_lr = 1e-3
             self.mcts_simulations = 30
-            self.temperature_moves = 40
+            self.temperature_moves = 15 
         else:
-            # ГРОССМЕЙСТЕРСКИЙ FINE-TUNING (Эпохи 51-100)
-            current_lr = 1e-4  # Снижаем скорость обучения в 10 раз
-            self.mcts_simulations = 150  # Мощнейшая глубина просчета
-            self.temperature_moves = 12  # Убираем хаос в дебютах
+            current_lr = 1e-4 
+            self.mcts_simulations = 150 
+            self.temperature_moves = 4 
             
-        # Обновляем скорость в оптимизаторе без потери накопленных моментов Adam
         for param_group in self.optimizer.param_groups:
             if param_group['lr'] != current_lr:
                 param_group['lr'] = current_lr
@@ -307,8 +305,6 @@ class AlphaZeroTrainer:
 
         for epoch in epoch_iter:
             self.current_epoch = epoch
-            
-            # ВЫЗОВ ДИНАМИЧЕСКОГО ШЕДУЛЕРА ПЕРЕД СТАРТОМ ЭПОХЫ
             self._apply_dynamic_scheduler(epoch)
             
             stats = self.self_play()
@@ -324,7 +320,6 @@ class AlphaZeroTrainer:
 
             if epoch % self.save_every == 0:
                 self.save_checkpoint(epoch)
-
 
 if __name__ == '__main__':
     import multiprocessing

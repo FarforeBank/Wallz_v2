@@ -1,10 +1,8 @@
 import math
-import copy
 import numpy as np
 import torch
 
 def invert_action_array(arr):
-    """Математически переворачивает массив вероятностей из 209 действий на 180 градусов (поворот)."""
     inverted = np.zeros_like(arr)
     inverted[:81] = np.rot90(arr[:81].reshape(9, 9), k=2).flatten()
     inverted[81:145] = np.rot90(arr[81:145].reshape(8, 8), k=2).flatten()
@@ -12,7 +10,6 @@ def invert_action_array(arr):
     return inverted
 
 def flip_action_array_horizontal(arr):
-    """Отражает массив действий по горизонтали (слева направо) для аугментации данных."""
     flipped = np.zeros_like(arr)
     flipped[:81] = np.fliplr(arr[:81].reshape(9, 9)).flatten()
     flipped[81:145] = np.fliplr(arr[81:145].reshape(8, 8)).flatten()
@@ -20,21 +17,26 @@ def flip_action_array_horizontal(arr):
     return flipped
 
 def flip_obs_horizontal(obs):
-    """Отражает графический тензор доски по горизонтали."""
     flipped = np.zeros_like(obs)
-    # Пешки, финишные линии и тепловые карты занимают всё пространство 9x9
     for i in [0, 1, 4, 5, 8, 9]:
         if i < obs.shape[0]:
             flipped[i] = np.fliplr(obs[i])
-    
-    # Стены занимают только матрицу 8x8 в левом верхнем углу!
     flipped[2, :8, :8] = np.fliplr(obs[2, :8, :8])
     flipped[3, :8, :8] = np.fliplr(obs[3, :8, :8])
-    
-    # Скалярные значения (остаток стен) просто копируем
     flipped[6] = obs[6]
     flipped[7] = obs[7]
     return flipped
+
+def get_canonical_obs(obs):
+    rotated = np.zeros_like(obs)
+    for i in [0, 1, 4, 5, 8, 9]:
+        if i < obs.shape[0]:
+            rotated[i] = np.rot90(obs[i], k=2)
+    rotated[2, :8, :8] = np.rot90(obs[2, :8, :8], k=2)
+    rotated[3, :8, :8] = np.rot90(obs[3, :8, :8], k=2)
+    rotated[6] = obs[6]
+    rotated[7] = obs[7]
+    return rotated
 
 class Node:
     def __init__(self, prior):
@@ -59,17 +61,18 @@ class MCTS:
         root = Node(prior=1.0)
         self._expand(root, env)
 
-        dirichlet_alpha = 0.3
-        epsilon = 0.25
         legal_actions = list(root.children.keys())
         if len(legal_actions) > 0:
+            dirichlet_alpha = 10.0 / max(1, len(legal_actions)) 
+            epsilon = 0.25
             noise = np.random.dirichlet([dirichlet_alpha] * len(legal_actions))
             for i, action in enumerate(legal_actions):
                 root.children[action].prior = root.children[action].prior * (1 - epsilon) + noise[i] * epsilon
 
         for _ in range(self.num_simulations):
             node = root
-            sim_env = copy.deepcopy(env)
+            # ИСПОЛЬЗУЕМ БЫСТРОЕ КОПИРОВАНИЕ
+            sim_env = env.clone() 
             search_path = [node]
 
             while len(node.children) > 0:
@@ -111,11 +114,9 @@ class MCTS:
         best_child = None
 
         for action, child in node.children.items():
-            # Если ход исследовали, берем его реальную оценку
             if child.visit_count > 0:
                 q_value = -child.value()
             else:
-                # FPU: Если ход неизвестен, предполагаем, что он чуть хуже текущей позиции
                 q_value = -node.value() - 0.1
 
             u_value = self.c_puct * child.prior * math.sqrt(max(1, node.visit_count)) / (1 + child.visit_count)
@@ -132,9 +133,8 @@ class MCTS:
         obs = env.get_observation()
         mask = env.get_legal_action_mask()
         
-        # КАНОНИЧЕСКОЕ ОТЗЕРКАЛИВАНИЕ
         if env.current_player == 2:
-            obs = np.rot90(obs, k=2, axes=(1, 2)).copy()
+            obs = get_canonical_obs(obs)
             mask = invert_action_array(mask)
 
         obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
@@ -146,7 +146,6 @@ class MCTS:
             logits = logits.squeeze(0).cpu().numpy()
             value = value.item()
             
-        # Возвращаем координаты в абсолютные для симулятора среды
         if env.current_player == 2:
             logits = invert_action_array(logits)
             
